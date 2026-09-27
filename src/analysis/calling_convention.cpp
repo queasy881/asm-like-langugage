@@ -13,6 +13,7 @@ const char* callConvName(CallConv c) {
     case CallConv::Stdcall: return "__stdcall";
     case CallConv::Fastcall: return "__fastcall";
     case CallConv::Thiscall: return "__thiscall";
+    case CallConv::LocalRegs: return "";
     default: return "";
     }
 }
@@ -43,6 +44,13 @@ ConventionInfo conventionInfo(CallConv cc, bool is64) {
     ci.volatileRegs = {Family::F_RAX, Family::F_RCX, Family::F_RDX};
     for (int i = 0; i <= 7; ++i) ci.volatileRegs.push_back(xmmFamily(i));
     switch (cc) {
+    case CallConv::LocalRegs:
+        // What GCC gives a static function it can see every call of: the
+        // first three integer arguments in eax, edx and ecx, the rest on the
+        // stack, and the caller still cleans up.
+        ci.intArgRegs = {Family::F_RAX, Family::F_RDX, Family::F_RCX};
+        ci.floatArgRegs = {0, 1, 2, 3};
+        break;
     case CallConv::Fastcall:
         ci.intArgRegs = {Family::F_RCX, Family::F_RDX};
         ci.calleeCleansStack = true;

@@ -100,6 +100,21 @@ Signature recoverSignature(Program& prog, const Function& mf, const ir::Function
     std::map<u32, ir::Type> types;
     std::set<u32> live = liveInLocations(f, types);
     auto isLive = [&](ir::Loc l) { return live.count(l.key()) > 0; };
+
+    // A compiler that can see every call of an internal function is free to
+    // invent a convention for it. GCC does this on x86: the first three
+    // integer arguments arrive in eax, edx and ecx. Reading eax or edx on
+    // entry is the tell, because no stack convention ever passes anything
+    // there.
+    if (!prog.is64() && !mf.fromExport && sig.conv != CallConv::LocalRegs) {
+        auto liveReg = [&](x86::Family fam) {
+            return isLive(ir::Loc{ir::LocKind::Reg, (u16)fam, (u16)ps});
+        };
+        if (liveReg(x86::Family::F_RAX) || liveReg(x86::Family::F_RDX)) {
+            sig.conv = CallConv::LocalRegs;
+            ci = conventionInfo(sig.conv, prog.is64());
+        }
+    }
     // Uses of each value, so a parameter's real width can be read off the
     // way the function consumes it.
     std::map<ValueId, std::vector<ValueId>> uses;
@@ -367,6 +382,11 @@ void SignatureDatabase::build(int maxRounds) {
             }
             lift::LiftOptions lo;
             lo.convention = defaultConvention(prog_.is64());
+            // Keep whatever the previous round worked out, so a function the
+            // compiler gave a private convention is lifted under it.
+            if (auto prev = byEntry_.find(va); prev != byEntry_.end() && prev->second.known &&
+                                               prev->second.conv != CallConv::Unknown)
+                lo.convention = prev->second.conv;
             lo.resolveCallee = res;
             auto lifted = lift::liftFunction(prog_, *mf, lo);
             lifted.func->pruneUnreachableBlocks();
@@ -377,7 +397,7 @@ void SignatureDatabase::build(int maxRounds) {
             Signature s = recoverSignature(prog_, *mf, *lifted.func, lo.convention);
             auto it = byEntry_.find(va);
             if (it == byEntry_.end() || it->second.paramTypes.size() != s.paramTypes.size() ||
-                it->second.returnType != s.returnType) {
+                it->second.returnType != s.returnType || it->second.conv != s.conv) {
                 changed = true;
             }
             byEntry_[va] = std::move(s);

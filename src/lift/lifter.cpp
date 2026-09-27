@@ -2312,6 +2312,47 @@ unsigned Lifter::guessArgumentCount(const Instruction& call, const ConventionInf
         widths.push_back(w ? w : (unsigned)pointerBytes());
         ++count;
     }
+
+    // Stack arguments. With the argument registers used up (or a convention
+    // that has none), the caller stages the rest just below the stack
+    // pointer, either by writing the slots or by pushing them. Without
+    // counting those an indirect call on x86 looks like it takes nothing.
+    if (count == maxArgs) {
+        unsigned ps = pointerBytes();
+        i64 base = ci.stackArgStart - (i64)ps;   // the return address is not pushed yet
+        std::set<i64> slots;
+        unsigned pushes = 0;
+        const auto& insns = mf_.blocks[curMachine_].insns;
+        size_t at = insns.size();
+        for (size_t i = 0; i < insns.size(); ++i)
+            if (insns[i].address == call.address) { at = i; break; }
+        bool pushRun = true;
+        for (size_t k = at; k-- > 0;) {
+            const Instruction& p = insns[k];
+            if (p.isCall()) break;
+            if (p.mnem == Mnem::Push) {
+                if (pushRun) ++pushes;
+                continue;
+            }
+            pushRun = false;
+            if (p.mnem != Mnem::Mov || p.numOps != 2 || !p.ops[0].isMem()) continue;
+            const MemOperand& m = p.ops[0].mem;
+            if (m.index != Reg::None) continue;
+            if (regFamily(m.base) != Family::F_RSP) continue;
+            if (p.ops[0].size != ps) continue;
+            i64 off = m.disp - base;
+            if (off < 0 || off % (i64)ps) continue;
+            slots.insert(off / (i64)ps);
+        }
+        unsigned n = 0;
+        while (slots.count((i64)n)) ++n;
+        if (pushes > n) n = pushes;
+        for (unsigned i = 0; i < n; ++i) {
+            isFloat.push_back(false);
+            widths.push_back(ps);
+        }
+        count += n;
+    }
     return count;
 }
 

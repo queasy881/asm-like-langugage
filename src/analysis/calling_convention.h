@@ -12,6 +12,7 @@ enum class CallConv : u8 {
     Stdcall,    // x86: callee cleans
     Fastcall,   // x86: ECX, EDX then stack, callee cleans
     Thiscall,   // x86: ECX = this, rest on stack, callee cleans
+    LocalRegs,  // a private convention a compiler gave an internal function
 };
 const char* callConvName(CallConv c);
 

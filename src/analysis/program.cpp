@@ -432,6 +432,19 @@ bool Program::resolveJumpTable(const std::map<u64, const Instruction*>& insns, c
                 }
                 continue;
             }
+            // A compiler narrows the index to its real width right before the
+            // table load: `movzx ebx, bl` after biasing by the first case
+            // value. That instruction is where the index is ready, and
+            // following it further folds the bias into the table address and
+            // loses the bound the compare established.
+            if (ok && !isLoad && !inTop && frozen.empty() && e.loadRegs.count(fam) &&
+                (cur->mnem == Mnem::Movzx || cur->mnem == Mnem::Movsx) && cur->numOps == 2 &&
+                cur->ops[1].isReg() && regFamily(cur->ops[1].reg) == fam) {
+                frozen.insert(fam);
+                out.indexAddress = cur->address;
+                indexPinned = true;
+                continue;
+            }
             if (!ok) {
                 if (e.loadRegs.count(fam) && !inTop && frozen.empty()) {
                     frozen.insert(fam);
