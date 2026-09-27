@@ -237,6 +237,18 @@ void RegFile::writeFamily(Family fam, unsigned bytes, unsigned offset, ValueId v
     st.narrowOffset = (u8)offset;
 }
 
+ValueId RegFile::readXmmHigh(Family fam) {
+    FamilyState& st = state(fam);
+    if (st.high == kNoValue) st.high = lifter_.emitReadRegHigh(fam);
+    return st.high;
+}
+
+void RegFile::writeXmmHigh(Family fam, ValueId value) {
+    FamilyState& st = state(fam);
+    st.high = value;
+    st.highDirty = true;
+}
+
 void RegFile::setStackRelative(Family fam, i64 delta) {
     FamilyState& st = state(fam);
     st.spRelative = true;
@@ -259,6 +271,11 @@ void RegFile::flush() {
         Family fam = (Family)i;
         ValueId v = materializeFull(fam);
         lifter_.emitWriteReg(fam, familyBytes(fam), v);
+    }
+    for (size_t i = 0; i < states_.size(); ++i) {
+        FamilyState& st = states_[i];
+        if (!st.highDirty) continue;
+        lifter_.emitWriteRegHigh((Family)i, st.high);
     }
 }
 

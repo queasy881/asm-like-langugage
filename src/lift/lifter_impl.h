@@ -22,6 +22,8 @@ public:
 
     ValueId emitReadReg(x86::Family fam, unsigned bytes);
     void emitWriteReg(x86::Family fam, unsigned bytes, ValueId v);
+    ValueId emitReadRegHigh(x86::Family fam);
+    void emitWriteRegHigh(x86::Family fam, ValueId v);
     ValueId emitTruncTo(ValueId v, unsigned bytes);
     ValueId emitZExtTo(ValueId v, unsigned bytes);
     ValueId emitSExtTo(ValueId v, unsigned bytes);

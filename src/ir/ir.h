@@ -140,6 +140,7 @@ enum class LocKind : u8 {
     Flag,    // index = FlagBit
     Stack,   // index = stack slot id (see StackFrame)
     Temp,    // index = lifter temporary
+    RegHigh, // index = x86::Family; the upper 64 bits of a 128-bit register
 };
 
 enum FlagBit : u8 { FlagCF = 0, FlagPF, FlagAF, FlagZF, FlagSF, FlagOF, FlagDF, FlagCount };

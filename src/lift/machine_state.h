@@ -97,6 +97,12 @@ struct FamilyState {
     // Symbolic stack tracking: value == entrySP + spDelta.
     bool spRelative = false;
     i64 spDelta = 0;
+    // 128-bit registers are held as two 64-bit lanes. The low lane is `base`
+    // and friends above; this is the upper one. Keeping them apart means every
+    // value the IR carries fits in 64 bits, which is what the rest of the
+    // pipeline (and the interpreter) can reason about.
+    ValueId high = kNoValue;
+    bool highDirty = false;
 };
 
 class Lifter;
@@ -112,6 +118,9 @@ public:
     ValueId readFamily(x86::Family fam, unsigned bytes, unsigned offset = 0);
     void write(x86::Reg reg, ValueId value);
     void writeFamily(x86::Family fam, unsigned bytes, unsigned offset, ValueId value);
+    // The upper 64 bits of a 128-bit register.
+    ValueId readXmmHigh(x86::Family fam);
+    void writeXmmHigh(x86::Family fam, ValueId value);
     // Marks the family as holding entrySP + delta.
     void setStackRelative(x86::Family fam, i64 delta);
     bool stackRelative(x86::Family fam, i64& delta) const;

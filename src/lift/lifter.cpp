@@ -195,6 +195,16 @@ void Lifter::emitWriteReg(Family fam, unsigned bytes, ValueId v) {
     fn_->writeLoc(cur_, l, v, addr_);
 }
 
+ValueId Lifter::emitReadRegHigh(Family fam) {
+    ir::Loc l{ir::LocKind::RegHigh, (u16)fam, 8};
+    return fn_->readLoc(cur_, l, ir::kI64, addr_);
+}
+
+void Lifter::emitWriteRegHigh(Family fam, ValueId v) {
+    ir::Loc l{ir::LocKind::RegHigh, (u16)fam, 8};
+    fn_->writeLoc(cur_, l, emitTruncTo(v, 8), addr_);
+}
+
 // Reinterprets a float value as the integer of the same width. Integer values
 // pass through untouched, so no cast appears unless one is really needed.
 ValueId Lifter::toIntBits(ValueId v) {
@@ -1373,13 +1383,28 @@ bool Lifter::liftSse(const Instruction& in) {
     case Mnem::Movaps: case Mnem::Movups: case Mnem::Movapd: case Mnem::Movupd:
     case Mnem::Movdqa: case Mnem::Movdqu: case Mnem::Vmovaps: case Mnem::Vmovups:
     case Mnem::Vmovdqa: case Mnem::Vmovdqu: case Mnem::Movntdq: {
-        // Treated as an opaque 128-bit copy; only whole-register moves are modelled.
-        unsigned bytes = 16;
-        ValueId v;
-        if (in.ops[1].isMem()) v = fn_->load(cur_, Type::i(128), effectiveAddress(in, in.ops[1]), addr_);
-        else v = regs_->readFamily(regFamily(in.ops[1].reg), bytes);
-        if (in.ops[0].isMem()) fn_->store(cur_, effectiveAddress(in, in.ops[0]), v, addr_);
-        else regs_->writeFamily(regFamily(in.ops[0].reg), bytes, 0, v);
+        // A 128-bit move, carried as its two 64-bit lanes so that every value
+        // stays inside a machine word the rest of the pipeline can reason
+        // about.
+        ValueId lo, hi;
+        if (in.ops[1].isMem()) {
+            ValueId base = effectiveAddress(in, in.ops[1]);
+            lo = fn_->load(cur_, ir::kI64, base, addr_);
+            hi = fn_->load(cur_, ir::kI64, bin(Op::Add, base, konstLike(base, 8)), addr_);
+        } else {
+            Family src = regFamily(in.ops[1].reg);
+            lo = emitTruncTo(regs_->readFamily(src, 8), 8);
+            hi = regs_->readXmmHigh(src);
+        }
+        if (in.ops[0].isMem()) {
+            ValueId base = effectiveAddress(in, in.ops[0]);
+            fn_->store(cur_, base, lo, addr_);
+            fn_->store(cur_, bin(Op::Add, base, konstLike(base, 8)), hi, addr_);
+        } else {
+            Family dst = regFamily(in.ops[0].reg);
+            regs_->writeFamily(dst, 8, 0, lo);
+            regs_->writeXmmHigh(dst, hi);
+        }
         return true;
     }
     case Mnem::Movnti: {
@@ -1397,7 +1422,10 @@ bool Lifter::liftSse(const Instruction& in) {
         return true;
     }
     case Mnem::Punpcklqdq: case Mnem::Unpcklpd: {
-        // The low half is unchanged; only the upper half takes the source.
+        // Moves the source's low lane into the destination's high lane. The
+        // low lane is untouched, so the two-lane model expresses it exactly.
+        if (!in.ops[0].isReg()) return false;
+        regs_->writeXmmHigh(regFamily(in.ops[0].reg), emitTruncTo(readOperand(in, 1), 8));
         return true;
     }
     case Mnem::Pshufd: {

@@ -116,6 +116,7 @@ std::string Loc::str() const {
     case LocKind::Flag: return flagName((FlagBit)index);
     case LocKind::Stack: return strfmt("slot%u", index);
     case LocKind::Temp: return strfmt("t%u", index);
+    case LocKind::RegHigh: return strfmt("reg%u.hi", index);
     }
     return "?";
 }
