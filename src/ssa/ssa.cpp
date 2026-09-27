@@ -195,6 +195,16 @@ SsaInfo construct(ir::Function& f) {
                     in.op = Op::Undef;
                     in.loc = ir::Loc{};
                     in.args.clear();
+                } else if (f.inst(cur).type.bits != in.type.bits &&
+                           f.inst(cur).type.kind == ir::TypeKind::Int &&
+                           in.type.kind == ir::TypeKind::Int) {
+                    // The reaching definition is a different width from the
+                    // read. x87 register slots do this: the location is 80
+                    // bits wide and code reads 64 of them. Reuse this
+                    // instruction as the conversion so the IR stays typed.
+                    in.op = f.inst(cur).type.bits > in.type.bits ? Op::Trunc : Op::ZExt;
+                    in.loc = ir::Loc{};
+                    in.args.assign(1, cur);
                 } else {
                     f.replaceAllUses(v, cur);
                     in.dead = true;

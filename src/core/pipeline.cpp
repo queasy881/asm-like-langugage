@@ -1,5 +1,7 @@
 #include "core/pipeline.h"
+#include "analysis/switch_recovery.h"
 #include <algorithm>
+#include <cstdlib>
 #include <set>
 
 namespace dc {
@@ -153,7 +155,7 @@ std::unique_ptr<FunctionResult> Pipeline::runToVariables(const Function& f) {
 
     // Spread cheap values back to their uses so they stay expressions instead
     // of turning into named temporaries.
-    opt::rematerializeCheapValues(*res->ir);
+    if (!getenv("DC_NO_REMAT")) opt::rematerializeCheapValues(*res->ir);
 
     types::TypeInference infer(prog_, types_, sigs_);
     res->types = infer.run(*res->ir, res->signature, res->frame);
@@ -200,6 +202,9 @@ std::unique_ptr<FunctionResult> Pipeline::runToOptimized(const Function& f) {
     auto res = runToSsa(f);
     if (opt_.optimize) {
         res->optStats = opt::optimize(*res->ir);
+        // Comparison trees back into switches, then another round so the
+        // now-dead comparisons go away.
+        if (!getenv("DC_NO_SWITCH") && recoverSwitches(*res->ir)) opt::optimize(*res->ir, 4);
         if (opt_.verifyStages) {
             for (const auto& e : res->ir->verify()) res->problems.push_back("opt-structure: " + e);
             for (const auto& e : ssa::verify(*res->ir)) res->problems.push_back("opt-ssa: " + e);

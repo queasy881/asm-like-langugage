@@ -185,7 +185,20 @@ ValueId Function::unary(int block, Op op, Type t, ValueId a, u64 addr) {
     return add(block, std::move(in));
 }
 
-ValueId Function::cast(int block, Op op, Type t, ValueId a, u64 addr) { return unary(block, op, t, a, addr); }
+ValueId Function::cast(int block, Op op, Type t, ValueId a, u64 addr) {
+    // An extension that does not extend is a no-op, and one that narrows is a
+    // truncation. Emitting either verbatim leaves the IR ill-typed, and the
+    // x87 paths reach here with 80-bit values that are already wide enough.
+    if (op == Op::ZExt || op == Op::SExt) {
+        unsigned from = inst(a).type.bits;
+        if (from == t.bits && inst(a).type.kind == t.kind) return a;
+        if (from > t.bits) op = Op::Trunc;
+    } else if (op == Op::Trunc) {
+        unsigned from = inst(a).type.bits;
+        if (from == t.bits && inst(a).type.kind == t.kind) return a;
+    }
+    return unary(block, op, t, a, addr);
+}
 
 ValueId Function::load(int block, Type t, ValueId addrVal, u64 addr) {
     Inst in;

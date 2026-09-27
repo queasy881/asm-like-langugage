@@ -356,6 +356,7 @@ bool Program::resolveJumpTable(const std::map<u64, const Instruction*>& insns, c
 
     std::set<Family> frozen; // index register(s) we stop substituting
     bool sawSignExtend = false;
+    bool indexPinned = false;   // the defining instruction for the index is known
     auto substitute = [&](std::map<Family, i64>& regs, i64& c, Family fam, const LinExpr& def) -> bool {
         auto it = regs.find(fam);
         if (it == regs.end()) return true;
@@ -376,6 +377,17 @@ bool Program::resolveJumpTable(const std::map<u64, const Instruction*>& insns, c
         if (!p) break;
         cur = p;
         if (cur->flow == Flow::Call || cur->flow == Flow::IndirectCall) break;
+        // Once the index register is known, the first definition of it walking
+        // backwards is where its value is ready to be read. Until then the
+        // index comes from a predecessor and is read at block entry.
+        if (!indexPinned) {
+            for (Family fr : frozen) {
+                if (!writesFamily(*cur, fr)) continue;
+                out.indexAddress = cur->address;
+                indexPinned = true;
+                break;
+            }
+        }
         // Collect families this instruction writes that we care about.
         std::vector<Family> fams;
         for (auto& [r, k] : e.regs) fams.push_back(r);
@@ -414,7 +426,9 @@ bool Program::resolveJumpTable(const std::map<u64, const Instruction*>& insns, c
                 }
                 if (idx != Family::None && bestScale > 1 && bestCount == 1) {
                     frozen.insert(idx);
-                    out.indexAddress = cur->address;
+                    // The load consumes the index; its value is whatever the
+                    // register held before this instruction.
+                    out.indexAddress = 0;
                 }
                 continue;
             }
@@ -422,6 +436,7 @@ bool Program::resolveJumpTable(const std::map<u64, const Instruction*>& insns, c
                 if (e.loadRegs.count(fam) && !inTop && frozen.empty()) {
                     frozen.insert(fam);
                     out.indexAddress = cur->address;
+                    indexPinned = true;
                     continue;
                 }
                 return false;
@@ -432,6 +447,7 @@ bool Program::resolveJumpTable(const std::map<u64, const Instruction*>& insns, c
                     if (frozen.empty()) {
                         frozen.insert(fam);
                         out.indexAddress = cur->address;
+                        indexPinned = true;
                         continue;
                     }
                     return false;
