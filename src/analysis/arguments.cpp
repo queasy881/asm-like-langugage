@@ -1,6 +1,7 @@
 #include "analysis/arguments.h"
 
 #include "analysis/stack_frame.h"
+#include "ssa/ssa.h"
 #include "winapi/api_database.h"
 
 #include <algorithm>

@@ -26,6 +26,7 @@ struct Options {
     bool frame = false;
     bool opt2 = false;
     bool stats = false;
+    bool sigs = false;
     bool verify = false;
     std::string function; // address or name filter
 };
@@ -44,6 +45,7 @@ void usage() {
         "  --frame             recovered stack frame layout\n"
         "  --opt               optimised SSA\n"
         "  --stats             per-function pipeline statistics\n"
+        "  --signatures        recovered function signatures\n"
         "  --verify            run IR verification and report problems\n"
         "\n"
         "filters:\n"
@@ -116,6 +118,7 @@ int main(int argc, char** argv) {
         else if (a == "--frame") opt.frame = true;
         else if (a == "--opt") opt.opt2 = true;
         else if (a == "--stats") opt.stats = true;
+        else if (a == "--signatures") opt.sigs = true;
         else if (a == "--verify") opt.verify = true;
         else if (a == "--function" && i + 1 < argc) opt.function = argv[++i];
         else if (!a.empty() && a[0] == '-') { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); usage(); return 2; }
@@ -135,6 +138,19 @@ int main(int argc, char** argv) {
         if (!opt.function.empty() && funcs.empty()) {
             std::fprintf(stderr, "error: no function matches '%s'\n", opt.function.c_str());
             return 1;
+        }
+        if (opt.sigs) {
+            PipelineOptions po;
+            Pipeline pipe(prog, po);
+            pipe.buildSignatures();
+            for (Function* f : funcs) {
+                const Signature* s = pipe.signatures().forFunction(f->entry);
+                std::printf("0x%llx  %s\n", (unsigned long long)f->entry,
+                            s ? s->str().c_str() : (f->name + "(?)").c_str());
+            }
+            std::printf("\n%zu signatures, %d rounds to a fixed point\n", pipe.signatures().size(),
+                        pipe.signatures().rounds());
+            return 0;
         }
         if (opt.ssa || opt.frame || opt.opt2 || opt.stats) {
             PipelineOptions po;

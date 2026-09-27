@@ -2,15 +2,31 @@
 
 namespace dc {
 
-Pipeline::Pipeline(Program& prog, PipelineOptions opt) : prog_(prog), opt_(opt) {}
+Pipeline::Pipeline(Program& prog, PipelineOptions opt) : prog_(prog), opt_(opt), sigs_(prog) {}
+
+void Pipeline::buildSignatures() {
+    if (sigsBuilt_) return;
+    sigs_.build();
+    sigsBuilt_ = true;
+}
 
 std::unique_ptr<FunctionResult> Pipeline::runToSsa(const Function& f) {
+    buildSignatures();
     auto res = std::make_unique<FunctionResult>();
     res->machine = &f;
     res->convention = defaultConvention(prog_.is64());
+    if (const Signature* s = sigs_.forFunction(f.entry)) {
+        res->signature = *s;
+        res->convention = s->conv;
+    }
 
     lift::LiftOptions lo;
     lo.convention = res->convention;
+    lo.resolveCallee = sigs_.resolver();
+    if (res->signature.known) {
+        lo.returnType = res->signature.returnType;
+        lo.returnTypeKnown = true;
+    }
     auto lifted = lift::liftFunction(prog_, f, lo);
     res->ir = std::move(lifted.func);
     res->unsupported = std::move(lifted.unsupported);

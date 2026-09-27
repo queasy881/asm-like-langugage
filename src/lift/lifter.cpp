@@ -1903,8 +1903,79 @@ void Lifter::computeStackDeltas() {
     }
 }
 
+namespace {
+
+// Conservative test for whether an instruction writes a register family.
+bool instWritesFamily(const Instruction& in, Family fam) {
+    if (fam == Family::None) return false;
+    switch (in.mnem) {
+    case Mnem::Cmp: case Mnem::Test: case Mnem::Push: case Mnem::Nop: case Mnem::Bt:
+    case Mnem::Jmp: case Mnem::Ret: case Mnem::Retf:
+        break;
+    default:
+        if (in.numOps >= 1 && in.ops[0].isReg() && regFamily(in.ops[0].reg) == fam) return true;
+        if (in.mnem == Mnem::Xchg && in.numOps == 2 && in.ops[1].isReg() && regFamily(in.ops[1].reg) == fam)
+            return true;
+        break;
+    }
+    switch (in.mnem) {
+    case Mnem::Mul: case Mnem::Div: case Mnem::Idiv: case Mnem::Cdq: case Mnem::Cqo: case Mnem::Cwd:
+        return fam == Family::F_RAX || fam == Family::F_RDX;
+    case Mnem::Imul:
+        return in.numOps == 1 && (fam == Family::F_RAX || fam == Family::F_RDX);
+    case Mnem::Cdqe: case Mnem::Cwde: case Mnem::Cbw:
+        return fam == Family::F_RAX;
+    case Mnem::Push: case Mnem::Pop: case Mnem::Leave: case Mnem::Enter:
+        return fam == Family::F_RSP || (in.mnem == Mnem::Leave && fam == Family::F_RBP);
+    case Mnem::Movsb: case Mnem::Movsw: case Mnem::MovsdStr: case Mnem::Movsq:
+    case Mnem::Stosb: case Mnem::Stosw: case Mnem::Stosd: case Mnem::Stosq:
+    case Mnem::Lodsb: case Mnem::Lodsw: case Mnem::Lodsd: case Mnem::Lodsq:
+    case Mnem::Scasb: case Mnem::Scasw: case Mnem::Scasd: case Mnem::Scasq:
+    case Mnem::Cmpsb: case Mnem::Cmpsw: case Mnem::CmpsdStr: case Mnem::Cmpsq:
+        return fam == Family::F_RSI || fam == Family::F_RDI || fam == Family::F_RCX;
+    default:
+        return false;
+    }
+}
+
+// True when `in` changes anything the operands of `def` read, which would make
+// re-evaluating `def` later produce a different result than the flags hold.
+bool clobbersOperandsOf(const Instruction& def, const Instruction& in) {
+    if (&def == &in) return false;
+    if (in.isCall()) return true;
+    bool defReadsMemory = false;
+    std::vector<Family> needed;
+    for (unsigned i = 0; i < def.numOps; ++i) {
+        const Operand& op = def.ops[i];
+        if (op.isReg()) needed.push_back(regFamily(op.reg));
+        else if (op.isMem()) {
+            defReadsMemory = true;
+            if (op.mem.base != Reg::None) needed.push_back(regFamily(op.mem.base));
+            if (op.mem.index != Reg::None) needed.push_back(regFamily(op.mem.index));
+        }
+    }
+    // Any store may change what a memory operand would read.
+    if (defReadsMemory) {
+        for (unsigned i = 0; i < in.numOps; ++i)
+            if (in.ops[i].isMem() && i == 0 && in.mnem != Mnem::Cmp && in.mnem != Mnem::Test) return true;
+        switch (in.mnem) {
+        case Mnem::Push: case Mnem::Movsb: case Mnem::Movsw: case Mnem::MovsdStr: case Mnem::Movsq:
+        case Mnem::Stosb: case Mnem::Stosw: case Mnem::Stosd: case Mnem::Stosq:
+            return true;
+        default:
+            break;
+        }
+    }
+    for (Family f : needed)
+        if (instWritesFamily(in, f)) return true;
+    return false;
+}
+
+} // namespace
+
 // A flag record only survives into a block when every predecessor leaves the
-// same defining instruction, and nothing in between clobbers the flags.
+// same defining instruction, the flags were not clobbered, and nothing has
+// changed the values that instruction compared.
 void Lifter::computeFlagEntryStates() {
     size_t n = mf_.blocks.size();
     flagDefIn_.assign(n, nullptr);
@@ -1920,6 +1991,10 @@ void Lifter::computeFlagEntryStates() {
                 flagEffects(in, r, w);
                 if (in.isCall()) def = nullptr;
                 else if (w) def = &in;
+                else if (def && clobbersOperandsOf(*def, in)) def = nullptr;
+                // Only cmp and test can be replayed; other flag writers have
+                // results that are not recoverable from the operands alone.
+                if (def && def->mnem != Mnem::Cmp && def->mnem != Mnem::Test) def = nullptr;
             }
             if (flagDefOut_[i] != def) {
                 flagDefOut_[i] = def;
