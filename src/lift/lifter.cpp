@@ -154,7 +154,9 @@ std::array<u8, (size_t)Family::Count> electRegisterWidths(const Function& f, boo
     for (size_t i = 0; i < (size_t)Family::Count; ++i) {
         Family fam = (Family)i;
         unsigned full = 8;
-        if (isXmmFamily(fam)) full = 16;
+        // A 128-bit register is held as two 64-bit lanes, so its location is
+        // never wider than a machine word.
+        if (isXmmFamily(fam)) full = 8;
         else if (isGprFamily(fam) || fam == Family::F_RIP) full = fullGpr;
         else if (fam >= Family::F_ES && fam <= Family::F_GS) full = 2;
         else if (fam == Family::F_FPSW) full = 2;
@@ -198,6 +200,230 @@ void Lifter::emitWriteReg(Family fam, unsigned bytes, ValueId v) {
 ValueId Lifter::emitReadRegHigh(Family fam) {
     ir::Loc l{ir::LocKind::RegHigh, (u16)fam, 8};
     return fn_->readLoc(cur_, l, ir::kI64, addr_);
+}
+
+bool Lifter::readLanes(const Instruction& in, unsigned opIndex, ValueId& lo, ValueId& hi) {
+    if (opIndex >= in.numOps) return false;
+    const Operand& op = in.ops[opIndex];
+    if (op.isReg()) {
+        Family fam = regFamily(op.reg);
+        if (!isXmmFamily(fam)) return false;
+        lo = emitTruncTo(regs_->readFamily(fam, 8), 8);
+        hi = regs_->readXmmHigh(fam);
+        return true;
+    }
+    if (op.isMem()) {
+        ValueId base = effectiveAddress(in, op);
+        lo = fn_->load(cur_, ir::kI64, base, addr_);
+        hi = fn_->load(cur_, ir::kI64, bin(Op::Add, base, konstLike(base, 8)), addr_);
+        return true;
+    }
+    return false;
+}
+
+void Lifter::writeLanes(const Instruction& in, unsigned opIndex, ValueId lo, ValueId hi) {
+    const Operand& op = in.ops[opIndex];
+    if (op.isReg()) {
+        Family fam = regFamily(op.reg);
+        regs_->writeFamily(fam, 8, 0, emitTruncTo(lo, 8));
+        regs_->writeXmmHigh(fam, hi);
+        return;
+    }
+    ValueId base = effectiveAddress(in, op);
+    fn_->store(cur_, base, emitTruncTo(lo, 8), addr_);
+    fn_->store(cur_, bin(Op::Add, base, konstLike(base, 8)), emitTruncTo(hi, 8), addr_);
+}
+
+// Packed SSE, modelled exactly over the two 64-bit lanes. Anything that needs
+// a value wider than a machine word, or a lane layout this cannot express, is
+// left to the honest "unsupported instruction" path.
+bool Lifter::liftPacked(const Instruction& in) {
+    auto k64 = [&](u64 v) { return konst(ir::kI64, v); };
+    // dst is operand 0; the VEX forms put the two sources after it.
+    unsigned sa = in.numOps == 3 ? 1 : 0;
+    unsigned sb = in.numOps == 3 ? 2 : 1;
+    ValueId al = kNoValue, ah = kNoValue, bl = kNoValue, bh = kNoValue;
+
+    auto binaryLanes = [&](Op op) -> bool {
+        if (!readLanes(in, sa, al, ah) || !readLanes(in, sb, bl, bh)) return false;
+        writeLanes(in, 0, bin(op, al, bl), bin(op, ah, bh));
+        return true;
+    };
+    // Adds or subtracts within each 32-bit half of a lane, without letting a
+    // carry cross the boundary.
+    auto dwordLanes = [&](bool sub) -> bool {
+        if (!readLanes(in, sa, al, ah) || !readLanes(in, sb, bl, bh)) return false;
+        auto halves = [&](ValueId x, ValueId y) {
+            ValueId mask = k64(0xFFFFFFFFull);
+            ValueId lowPart = bin(Op::And, bin(sub ? Op::Sub : Op::Add,
+                                               bin(Op::And, x, mask), bin(Op::And, y, mask)), mask);
+            ValueId highPart = bin(Op::Shl,
+                                   bin(Op::And, bin(sub ? Op::Sub : Op::Add,
+                                                    bin(Op::LShr, x, k64(32)), bin(Op::LShr, y, k64(32))),
+                                       mask),
+                                   k64(32));
+            return bin(Op::Or, lowPart, highPart);
+        };
+        writeLanes(in, 0, halves(al, bl), halves(ah, bh));
+        return true;
+    };
+
+    switch (in.mnem) {
+    case Mnem::Pxor: case Mnem::Xorps: case Mnem::Xorpd:
+    case Mnem::Vpxor: case Mnem::Vxorps: case Mnem::Vxorpd:
+        return binaryLanes(Op::Xor);
+    case Mnem::Pand: case Mnem::Andps: case Mnem::Andpd:
+        return binaryLanes(Op::And);
+    case Mnem::Por: case Mnem::Orps: case Mnem::Orpd:
+        return binaryLanes(Op::Or);
+    case Mnem::Paddq:
+        return binaryLanes(Op::Add);
+    case Mnem::Psubq:
+        return binaryLanes(Op::Sub);
+    case Mnem::Paddd:
+        return dwordLanes(false);
+    case Mnem::Psubd:
+        return dwordLanes(true);
+    case Mnem::Pandn: case Mnem::Andnps: case Mnem::Andnpd: {
+        if (!readLanes(in, sa, al, ah) || !readLanes(in, sb, bl, bh)) return false;
+        writeLanes(in, 0, bin(Op::And, fn_->unary(cur_, Op::Not, ir::kI64, al, addr_), bl),
+                   bin(Op::And, fn_->unary(cur_, Op::Not, ir::kI64, ah, addr_), bh));
+        return true;
+    }
+    case Mnem::Pmuludq: {
+        if (!readLanes(in, sa, al, ah) || !readLanes(in, sb, bl, bh)) return false;
+        ValueId mask = k64(0xFFFFFFFFull);
+        writeLanes(in, 0, bin(Op::Mul, bin(Op::And, al, mask), bin(Op::And, bl, mask)),
+                   bin(Op::Mul, bin(Op::And, ah, mask), bin(Op::And, bh, mask)));
+        return true;
+    }
+    case Mnem::Psrlq: case Mnem::Psllq: {
+        if (in.numOps < 2 || !in.ops[in.numOps - 1].isImm()) return false;
+        if (!readLanes(in, sa, al, ah)) return false;
+        u64 n = (u64)in.ops[in.numOps - 1].imm;
+        if (n >= 64) { writeLanes(in, 0, k64(0), k64(0)); return true; }
+        Op op = in.mnem == Mnem::Psrlq ? Op::LShr : Op::Shl;
+        writeLanes(in, 0, bin(op, al, k64(n)), bin(op, ah, k64(n)));
+        return true;
+    }
+    case Mnem::Psrldq: case Mnem::Pslldq: {
+        // A byte shift of the whole 128-bit value.
+        if (in.numOps < 2 || !in.ops[in.numOps - 1].isImm()) return false;
+        if (!readLanes(in, 0, al, ah)) return false;
+        u64 n = (u64)in.ops[in.numOps - 1].imm;
+        if (n >= 16) { writeLanes(in, 0, k64(0), k64(0)); return true; }
+        unsigned bits = (unsigned)(n * 8);
+        ValueId lo, hi;
+        if (in.mnem == Mnem::Psrldq) {
+            if (bits == 0) { lo = al; hi = ah; }
+            else if (bits < 64)
+                lo = bin(Op::Or, bin(Op::LShr, al, k64(bits)), bin(Op::Shl, ah, k64(64 - bits))),
+                hi = bin(Op::LShr, ah, k64(bits));
+            else if (bits == 64) { lo = ah; hi = k64(0); }
+            else { lo = bin(Op::LShr, ah, k64(bits - 64)); hi = k64(0); }
+        } else {
+            if (bits == 0) { lo = al; hi = ah; }
+            else if (bits < 64)
+                hi = bin(Op::Or, bin(Op::Shl, ah, k64(bits)), bin(Op::LShr, al, k64(64 - bits))),
+                lo = bin(Op::Shl, al, k64(bits));
+            else if (bits == 64) { hi = al; lo = k64(0); }
+            else { hi = bin(Op::Shl, al, k64(bits - 64)); lo = k64(0); }
+        }
+        writeLanes(in, 0, lo, hi);
+        return true;
+    }
+    case Mnem::Punpckldq: case Mnem::Unpcklps: {
+        // Interleaves the low four dwords of the two operands.
+        if (!readLanes(in, sa, al, ah) || !readLanes(in, sb, bl, bh)) return false;
+        ValueId mask = k64(0xFFFFFFFFull);
+        ValueId outLo = bin(Op::Or, bin(Op::And, al, mask),
+                            bin(Op::Shl, bin(Op::And, bl, mask), k64(32)));
+        ValueId outHi = bin(Op::Or, bin(Op::LShr, al, k64(32)),
+                            bin(Op::Shl, bin(Op::LShr, bl, k64(32)), k64(32)));
+        writeLanes(in, 0, outLo, outHi);
+        return true;
+    }
+    case Mnem::Pcmpeqd: case Mnem::Pcmpeqb: {
+        if (!readLanes(in, sa, al, ah) || !readLanes(in, sb, bl, bh)) return false;
+        unsigned esz = in.mnem == Mnem::Pcmpeqd ? 32 : 8;
+        u64 unit = esz == 32 ? 0xFFFFFFFFull : 0xFFull;
+        auto lane = [&](ValueId x, ValueId y) {
+            ValueId acc = k64(0);
+            for (unsigned sh = 0; sh < 64; sh += esz) {
+                ValueId xe = bin(Op::And, bin(Op::LShr, x, k64(sh)), k64(unit));
+                ValueId ye = bin(Op::And, bin(Op::LShr, y, k64(sh)), k64(unit));
+                ValueId eq = zeroExtendBool(cmp(Op::CmpEq, xe, ye), ir::kI64);
+                acc = bin(Op::Or, acc, bin(Op::Shl, bin(Op::Mul, eq, k64(unit)), k64(sh)));
+            }
+            return acc;
+        };
+        writeLanes(in, 0, lane(al, bl), lane(ah, bh));
+        return true;
+    }
+    case Mnem::Movhlps: {
+        if (!readLanes(in, 1, bl, bh) || !in.ops[0].isReg()) return false;
+        regs_->writeFamily(regFamily(in.ops[0].reg), 8, 0, bh);
+        return true;
+    }
+    case Mnem::Movlhps: {
+        if (!readLanes(in, 1, bl, bh) || !in.ops[0].isReg()) return false;
+        regs_->writeXmmHigh(regFamily(in.ops[0].reg), bl);
+        return true;
+    }
+    case Mnem::Punpckhqdq: case Mnem::Unpckhpd: {
+        if (!readLanes(in, sa, al, ah) || !readLanes(in, sb, bl, bh)) return false;
+        writeLanes(in, 0, ah, bh);
+        return true;
+    }
+    case Mnem::Shufpd: {
+        // Non-VEX is dst, src, imm: the destination is also the first source.
+        if (in.numOps < 3 || !in.ops[in.numOps - 1].isImm()) return false;
+        sa = in.numOps == 4 ? 1 : 0;
+        sb = in.numOps == 4 ? 2 : 1;
+        if (!readLanes(in, sa, al, ah) || !readLanes(in, sb, bl, bh)) return false;
+        u64 sel = (u64)in.ops[in.numOps - 1].imm;
+        writeLanes(in, 0, (sel & 1) ? ah : al, (sel & 2) ? bh : bl);
+        return true;
+    }
+    case Mnem::Pshufd: {
+        if (in.numOps != 3 || !in.ops[2].isImm() || !in.ops[0].isReg()) return false;
+        if (!readLanes(in, 1, bl, bh)) return false;
+        u64 sel = (u64)in.ops[2].imm;
+        auto dword = [&](unsigned i) {
+            ValueId src = (i & 2) ? bh : bl;
+            ValueId v = (i & 1) ? bin(Op::LShr, src, k64(32)) : src;
+            return bin(Op::And, v, k64(0xFFFFFFFFull));
+        };
+        auto lane = [&](unsigned d0, unsigned d1) {
+            return bin(Op::Or, dword(d0), bin(Op::Shl, dword(d1), k64(32)));
+        };
+        writeLanes(in, 0, lane((unsigned)(sel & 3), (unsigned)((sel >> 2) & 3)),
+                   lane((unsigned)((sel >> 4) & 3), (unsigned)((sel >> 6) & 3)));
+        return true;
+    }
+    case Mnem::Shufps: {
+        // The low lane comes from the destination, the high lane from the
+        // source; each selector picks one of that operand's four dwords.
+        if (in.numOps < 3 || !in.ops[in.numOps - 1].isImm()) return false;
+        sa = in.numOps == 4 ? 1 : 0;
+        sb = in.numOps == 4 ? 2 : 1;
+        if (!readLanes(in, sa, al, ah) || !readLanes(in, sb, bl, bh)) return false;
+        u64 sel = (u64)in.ops[in.numOps - 1].imm;
+        auto dword = [&](ValueId lo2, ValueId hi2, unsigned i) {
+            ValueId src = (i & 2) ? hi2 : lo2;
+            ValueId v = (i & 1) ? bin(Op::LShr, src, k64(32)) : src;
+            return bin(Op::And, v, k64(0xFFFFFFFFull));
+        };
+        ValueId outLo = bin(Op::Or, dword(al, ah, (unsigned)(sel & 3)),
+                            bin(Op::Shl, dword(al, ah, (unsigned)((sel >> 2) & 3)), k64(32)));
+        ValueId outHi = bin(Op::Or, dword(bl, bh, (unsigned)((sel >> 4) & 3)),
+                            bin(Op::Shl, dword(bl, bh, (unsigned)((sel >> 6) & 3)), k64(32)));
+        writeLanes(in, 0, outLo, outHi);
+        return true;
+    }
+    default:
+        return false;
+    }
 }
 
 void Lifter::emitWriteRegHigh(Family fam, ValueId v) {
@@ -1376,8 +1602,15 @@ bool Lifter::liftSse(const Instruction& in) {
         ValueId v;
         if (in.ops[1].isMem()) v = fn_->load(cur_, intTypeForBytes(bytes), effectiveAddress(in, in.ops[1]), addr_);
         else v = emitTruncTo(regs_->readFamily(regFamily(in.ops[1].reg), bytes), bytes);
-        if (in.ops[0].isMem()) fn_->store(cur_, effectiveAddress(in, in.ops[0]), v, addr_);
-        else regs_->writeFamily(regFamily(in.ops[0].reg), bytes, 0, v);
+        if (in.ops[0].isMem()) {
+            fn_->store(cur_, effectiveAddress(in, in.ops[0]), v, addr_);
+        } else {
+            Family dst = regFamily(in.ops[0].reg);
+            regs_->writeFamily(dst, bytes, 0, v);
+            // movd and movq into a vector register clear everything above the
+            // value they move.
+            if (isXmmFamily(dst)) regs_->writeXmmHigh(dst, konst(ir::kI64, 0));
+        }
         return true;
     }
     case Mnem::Movaps: case Mnem::Movups: case Mnem::Movapd: case Mnem::Movupd:
@@ -1426,23 +1659,6 @@ bool Lifter::liftSse(const Instruction& in) {
         // low lane is untouched, so the two-lane model expresses it exactly.
         if (!in.ops[0].isReg()) return false;
         regs_->writeXmmHigh(regFamily(in.ops[0].reg), emitTruncTo(readOperand(in, 1), 8));
-        return true;
-    }
-    case Mnem::Pshufd: {
-        if (in.numOps != 3 || !in.ops[2].isImm() || !in.ops[0].isReg()) return false;
-        unsigned sel = (unsigned)in.ops[2].imm;
-        unsigned s0 = sel & 3, s1 = (sel >> 2) & 3;
-        // Only selectors that stay inside the low 64 bits can be modelled
-        // without a full 128-bit value.
-        if (s0 > 1 || s1 > 1) return false;
-        ValueId src = emitZExtTo(readOperand(in, 1), 8);
-        auto dword = [&](unsigned i) {
-            ValueId v = i ? bin(Op::LShr, src, konst(ir::kI64, 32)) : src;
-            return bin(Op::And, v, konst(ir::kI64, 0xFFFFFFFFull));
-        };
-        ValueId lo = dword(s0);
-        ValueId hi = bin(Op::Shl, dword(s1), konst(ir::kI64, 32));
-        regs_->writeFamily(regFamily(in.ops[0].reg), 8, 0, bin(Op::Or, lo, hi));
         return true;
     }
     default:
@@ -1896,6 +2112,7 @@ void Lifter::liftInstruction(const Instruction& in) {
     if (liftMulDiv(in)) return;
     if (liftBits(in)) return;
     if (liftStack(in)) return;
+    if (liftPacked(in)) return;
     if (liftSse(in)) return;
     if (liftX87(in)) return;
     if (liftStringOp(in)) return;

@@ -1,4 +1,5 @@
 #include "lift/machine_state.h"
+#include <algorithm>
 
 #include "lift/lifter_impl.h"
 
@@ -147,7 +148,8 @@ unsigned RegFile::familyBytes(Family fam) const {
     // The elected width, so a register only ever used narrowly never needs a
     // cast to reach its architectural width.
     unsigned w = lifter_.familyWidth(fam);
-    return w ? w : (isXmmFamily(fam) ? 16 : fullBytes_);
+    if (isXmmFamily(fam)) return w ? std::min(w, 8u) : 8u;
+    return w ? w : fullBytes_;
 }
 
 void RegFile::reset() {

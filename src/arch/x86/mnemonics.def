@@ -45,7 +45,7 @@ X(Shufps, "shufps") X(Shufpd, "shufpd") X(Pshufd, "pshufd") X(Punpckldq, "punpck
 X(Unpcklps, "unpcklps") X(Unpcklpd, "unpcklpd") X(Unpckhpd, "unpckhpd") X(Paddd, "paddd") X(Paddq, "paddq") X(Psubd, "psubd") X(Psubq, "psubq")
 X(Pcmpeqb, "pcmpeqb") X(Pcmpeqd, "pcmpeqd") X(Pmovmskb, "pmovmskb") X(Movmskps, "movmskps") X(Movmskpd, "movmskpd")
 X(Cvtdq2pd, "cvtdq2pd") X(Cvtdq2ps, "cvtdq2ps") X(Cvtps2pd, "cvtps2pd") X(Cvtpd2ps, "cvtpd2ps") X(Cvttps2dq, "cvttps2dq")
-X(Psrldq, "psrldq") X(Pslldq, "pslldq") X(Psrlq, "psrlq") X(Psllq, "psllq") X(Pinsrd, "pinsrd") X(Pextrd, "pextrd") X(Pinsrq, "pinsrq") X(Pextrq, "pextrq")
+X(Pmuludq, "pmuludq") X(Psrldq, "psrldq") X(Pslldq, "pslldq") X(Psrlq, "psrlq") X(Psllq, "psllq") X(Pinsrd, "pinsrd") X(Pextrd, "pextrd") X(Pinsrq, "pinsrq") X(Pextrq, "pextrq")
 X(Roundss, "roundss") X(Roundsd, "roundsd")
 X(Vmovss, "vmovss") X(Vmovsd, "vmovsd") X(Vmovaps, "vmovaps") X(Vmovups, "vmovups") X(Vmovdqa, "vmovdqa") X(Vmovdqu, "vmovdqu")
 X(Vmovd, "vmovd") X(Vmovq, "vmovq") X(Vaddss, "vaddss") X(Vaddsd, "vaddsd") X(Vsubss, "vsubss") X(Vsubsd, "vsubsd")

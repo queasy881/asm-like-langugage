@@ -23,6 +23,11 @@ public:
     ValueId emitReadReg(x86::Family fam, unsigned bytes);
     void emitWriteReg(x86::Family fam, unsigned bytes, ValueId v);
     ValueId emitReadRegHigh(x86::Family fam);
+    // Reads a 128-bit operand as its two 64-bit lanes; false when the operand
+    // is not something the lane model can express.
+    bool readLanes(const x86::Instruction& in, unsigned opIndex, ValueId& lo, ValueId& hi);
+    void writeLanes(const x86::Instruction& in, unsigned opIndex, ValueId lo, ValueId hi);
+    bool liftPacked(const x86::Instruction& in);
     void emitWriteRegHigh(x86::Family fam, ValueId v);
     ValueId emitTruncTo(ValueId v, unsigned bytes);
     ValueId emitZExtTo(ValueId v, unsigned bytes);
