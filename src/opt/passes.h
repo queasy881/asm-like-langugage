@@ -19,6 +19,7 @@ struct Stats {
     int castsRemoved = 0;
     int valuesNarrowed = 0;
     int loadsForwarded = 0;
+    int loadsShared = 0;
     int phisRemoved = 0;
     int rounds = 0;
 
@@ -26,7 +27,7 @@ struct Stats {
     int total() const {
         return constantsFolded + copiesPropagated + instructionsRemoved + expressionsShared +
                algebraicSimplifications + branchesSimplified + castsRemoved + valuesNarrowed +
-               loadsForwarded + phisRemoved;
+               loadsForwarded + loadsShared + phisRemoved;
     }
 };
 
@@ -37,6 +38,9 @@ int deadCodeElimination(ir::Function& f);
 int commonSubexpressionElimination(ir::Function& f);
 int simplifyBranches(ir::Function& f);
 int forwardStackLoads(ir::Function& f);
+// Removes a load that repeats an earlier one of the same address when no
+// memory write can happen in between.
+int redundantLoadElimination(ir::Function& f);
 // Rewrites values whose upper bits are never observed to their natural width,
 // which is what removes the casts left over from sub-register writes.
 int narrowByDemandedBits(ir::Function& f);

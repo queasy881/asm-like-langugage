@@ -1903,6 +1903,48 @@ void Lifter::computeStackDeltas() {
     }
 }
 
+// A flag record only survives into a block when every predecessor leaves the
+// same defining instruction, and nothing in between clobbers the flags.
+void Lifter::computeFlagEntryStates() {
+    size_t n = mf_.blocks.size();
+    flagDefIn_.assign(n, nullptr);
+    flagDefOut_.assign(n, nullptr);
+    std::vector<char> known(n, 0);
+    const x86::Instruction* const kConflict = (const x86::Instruction*)1;
+    for (int round = 0; round < 4; ++round) {
+        bool changed = false;
+        for (size_t i = 0; i < n; ++i) {
+            const x86::Instruction* def = flagDefIn_[i] == kConflict ? nullptr : flagDefIn_[i];
+            for (const auto& in : mf_.blocks[i].insns) {
+                FlagMask r, w;
+                flagEffects(in, r, w);
+                if (in.isCall()) def = nullptr;
+                else if (w) def = &in;
+            }
+            if (flagDefOut_[i] != def) {
+                flagDefOut_[i] = def;
+                changed = true;
+            }
+        }
+        for (size_t i = 0; i < n; ++i) {
+            const x86::Instruction* merged = nullptr;
+            bool first = true, conflict = false;
+            for (int p : mf_.blocks[i].preds) {
+                const x86::Instruction* d = flagDefOut_[p];
+                if (first) { merged = d; first = false; }
+                else if (merged != d) conflict = true;
+            }
+            const x86::Instruction* want = (first || conflict) ? nullptr : merged;
+            if (flagDefIn_[i] != want) {
+                flagDefIn_[i] = want;
+                changed = true;
+            }
+        }
+        if (!changed) break;
+    }
+    (void)known;
+}
+
 void Lifter::liftBlock(int mb) {
     const BasicBlock& b = mf_.blocks[mb];
     curMachine_ = mb;
@@ -1914,6 +1956,34 @@ void Lifter::liftBlock(int mb) {
     spDelta_ = blockEntrySp_[mb];
     spKnown_ = blockSpKnown_[mb] != 0;
     if (spKnown_) regs_->setStackRelative(Family::F_RSP, spDelta_);
+
+    // Re-evaluate the comparison that set the incoming flags so conditions in
+    // this block fold to a single comparison instead of composing flag bits.
+    // The operands are re-read as ordinary location reads, which SSA resolves
+    // back to the same values the defining block computed.
+    if (mb < (int)flagDefIn_.size() && flagDefIn_[mb]) {
+        const Instruction& def = *flagDefIn_[mb];
+        u64 saveAddr = addr_;
+        addr_ = def.address;
+        switch (def.mnem) {
+        case Mnem::Cmp: {
+            ValueId a = readOperand(def, 0);
+            ValueId c = emitTruncTo(readOperand(def, 1), bytesOf(a));
+            setFlagsSub(a, c, bin(Op::Sub, a, c));
+            break;
+        }
+        case Mnem::Test: {
+            ValueId a = readOperand(def, 0);
+            ValueId c = emitTruncTo(readOperand(def, 1), bytesOf(a));
+            bool same = def.ops[0].isReg() && def.ops[1].isReg() && def.ops[0].reg == def.ops[1].reg;
+            setFlagsLogic(a, c, same ? a : bin(Op::And, a, c));
+            break;
+        }
+        default:
+            break;
+        }
+        addr_ = saveAddr;
+    }
 
     const JumpTable* jt = b.jumpTable >= 0 ? &mf_.jumpTables[b.jumpTable] : nullptr;
     size_t callIdx = 0;
@@ -2106,6 +2176,7 @@ void Lifter::emitTerminator(const BasicBlock& b) {
 
 LiftResult Lifter::run() {
     computeStackDeltas();
+    computeFlagEntryStates();
     blockMap_.assign(mf_.blocks.size(), -1);
     for (size_t i = 0; i < mf_.blocks.size(); ++i) blockMap_[i] = fn_->addBlock(mf_.blocks[i].start);
     for (size_t i = 0; i < mf_.blocks.size(); ++i) liftBlock((int)i);

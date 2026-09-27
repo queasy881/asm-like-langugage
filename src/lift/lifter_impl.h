@@ -93,6 +93,10 @@ private:
 
     // --- block plumbing ---
     void liftBlock(int machineBlock);
+    // Propagates the symbolic flag record into blocks whose predecessors all
+    // leave the same one, so a cmp in one block still folds with a jcc or
+    // cmov in the next.
+    void computeFlagEntryStates();
     void emitTerminator(const BasicBlock& mb);
 
     Program& prog_;
@@ -117,6 +121,9 @@ private:
     std::vector<char> blockSpKnown_;
     ValueId callResult_ = kNoValue;
     std::array<ValueId, ir::FlagCount> flagLoc_{}; // cached ReadLoc per flag
+    // Machine block -> the instruction whose flags reach its entry, or null.
+    std::vector<const x86::Instruction*> flagDefIn_;
+    std::vector<const x86::Instruction*> flagDefOut_;
 };
 
 } // namespace dc::lift

@@ -558,6 +558,106 @@ int forwardStackLoads(ir::Function& f) {
     return changed;
 }
 
+// Two loads of the same address and type may share a value when no store,
+// call or side-effecting intrinsic can execute between them on any path.
+int redundantLoadElimination(ir::Function& f) {
+    int nb = f.blockCount();
+    if (nb == 0) return 0;
+    Digraph g = f.cfg();
+    DomTree dom = DomTree::build(g);
+
+    // Blocks that contain anything able to write memory.
+    std::vector<char> writes(nb, 0);
+    for (const auto& b : f.blocks()) {
+        for (ValueId v : b.insts) {
+            const ir::Inst& in = f.inst(v);
+            if (in.dead) continue;
+            if (in.op == Op::Store || in.op == Op::Call || (in.op == Op::Intrinsic && in.aux)) {
+                writes[b.id] = 1;
+                break;
+            }
+        }
+    }
+    // Which blocks can reach which, for the "between" test.
+    std::vector<std::vector<bool>> reaches(nb);
+    for (int i = 0; i < nb; ++i) reaches[i] = reachableFrom(g, i);
+
+    auto writeBetween = [&](int defBlock, size_t defPos, int useBlock, size_t usePos) {
+        if (defBlock == useBlock) {
+            const auto& list = f.block(defBlock).insts;
+            for (size_t i = defPos + 1; i < usePos && i < list.size(); ++i) {
+                const ir::Inst& in = f.inst(list[i]);
+                if (in.dead) continue;
+                if (in.op == Op::Store || in.op == Op::Call || (in.op == Op::Intrinsic && in.aux)) return true;
+            }
+            // A block inside a loop can come back around to itself.
+            for (int s : f.block(defBlock).succs)
+                if (reaches[s][defBlock]) return true;
+            return false;
+        }
+        // The tail of the defining block after the load.
+        {
+            const auto& list = f.block(defBlock).insts;
+            for (size_t i = defPos + 1; i < list.size(); ++i) {
+                const ir::Inst& in = f.inst(list[i]);
+                if (in.dead) continue;
+                if (in.op == Op::Store || in.op == Op::Call || (in.op == Op::Intrinsic && in.aux)) return true;
+            }
+        }
+        // The head of the using block before the second load.
+        {
+            const auto& list = f.block(useBlock).insts;
+            for (size_t i = 0; i < usePos && i < list.size(); ++i) {
+                const ir::Inst& in = f.inst(list[i]);
+                if (in.dead) continue;
+                if (in.op == Op::Store || in.op == Op::Call || (in.op == Op::Intrinsic && in.aux)) return true;
+            }
+        }
+        // Every block that lies on a path from one to the other.
+        for (int m = 0; m < nb; ++m) {
+            if (m == defBlock || m == useBlock) continue;
+            if (!reaches[defBlock][m] || !reaches[m][useBlock]) continue;
+            if (writes[m]) return true;
+        }
+        return false;
+    };
+
+    struct LoadRec {
+        ValueId value;
+        int block;
+        size_t pos;
+    };
+    std::map<std::pair<ValueId, u32>, std::vector<LoadRec>> byAddress;
+    int changed = 0;
+    for (int b : dom.rpo()) {
+        const auto& list = f.block(b).insts;
+        for (size_t i = 0; i < list.size(); ++i) {
+            ValueId v = list[i];
+            const ir::Inst& in = f.inst(v);
+            if (in.dead || in.op != Op::Load) continue;
+            auto key = std::make_pair(in.args[0], (u32)in.type.bits | ((u32)in.type.kind << 16));
+            auto& recs = byAddress[key];
+            ValueId found = kNoValue;
+            for (const auto& r : recs) {
+                if (f.inst(r.value).dead) continue;
+                if (!dom.dominates(r.block, b)) continue;
+                if (r.block == b && r.pos >= i) continue;
+                if (writeBetween(r.block, r.pos, b, i)) continue;
+                found = r.value;
+                break;
+            }
+            if (found != kNoValue) {
+                replaceWith(f, v, found);
+                ++changed;
+            } else {
+                recs.push_back({v, b, i});
+            }
+        }
+    }
+    if (changed) f.removeDeadInsts();
+    return changed;
+}
+
 // --- demanded bits ---------------------------------------------------------
 
 int narrowByDemandedBits(ir::Function& f) {
@@ -799,6 +899,7 @@ Stats optimize(ir::Function& f, int maxRounds) {
         st.phisRemoved += ssa::simplifyPhis(f);
         st.loadsForwarded += forwardStackLoads(f);
         st.expressionsShared += commonSubexpressionElimination(f);
+        st.loadsShared += redundantLoadElimination(f);
         st.castsRemoved += narrowByDemandedBits(f);
         st.instructionsRemoved += deadCodeElimination(f);
         if (st.total() == before) break;
