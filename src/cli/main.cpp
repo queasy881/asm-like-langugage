@@ -1,8 +1,11 @@
 // decomp: Windows x86/x64 PE decompiler command line interface.
+#include "analysis/cfg_dump.h"
+#include "analysis/program.h"
 #include "disasm/disassembler.h"
 #include "pe/pe_image.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -10,12 +13,27 @@ using namespace dc;
 
 namespace {
 
+struct Options {
+    std::string path;
+    bool disasm = false;
+    bool functions = false;
+    bool cfg = false;
+    bool blocks = false;
+    std::string function; // address or name filter
+};
+
 void usage() {
     std::printf(
         "usage: decomp <image.exe|image.dll> [options]\n"
         "\n"
-        "options:\n"
+        "views:\n"
         "  --disasm            linear disassembly of executable sections\n"
+        "  --functions         discovered functions and their blocks\n"
+        "  --blocks            basic blocks with instructions\n"
+        "  --cfg               control-flow graphs (edges, dominators, loops)\n"
+        "\n"
+        "filters:\n"
+        "  --function <addr|name>  restrict output to one function\n"
         "  --help              show this help\n");
 }
 
@@ -49,24 +67,62 @@ void linearDisasm(const pe::Image& img) {
     }
 }
 
+// Resolves --function: hex address or function name.
+std::vector<Function*> selectFunctions(Program& prog, const std::string& sel, bool includeThunks) {
+    std::vector<Function*> out;
+    if (!sel.empty()) {
+        char* end = nullptr;
+        unsigned long long va = std::strtoull(sel.c_str(), &end, 16);
+        if (end && *end == 0 && va) {
+            if (Function* f = prog.ensureFunction(va)) out.push_back(f);
+            return out;
+        }
+        for (const auto& [a, f] : prog.functions())
+            if (f->name == sel) out.push_back(f.get());
+        return out;
+    }
+    for (const auto& [a, f] : prog.functions())
+        if (includeThunks || !f->isImportThunk) out.push_back(f.get());
+    return out;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
-    std::string path;
-    bool disasm = false;
+    Options opt;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--help" || a == "-h") { usage(); return 0; }
-        else if (a == "--disasm") disasm = true;
+        else if (a == "--disasm") opt.disasm = true;
+        else if (a == "--functions") opt.functions = true;
+        else if (a == "--cfg") opt.cfg = true;
+        else if (a == "--blocks") opt.blocks = true;
+        else if (a == "--function" && i + 1 < argc) opt.function = argv[++i];
         else if (!a.empty() && a[0] == '-') { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); usage(); return 2; }
-        else path = a;
+        else opt.path = a;
     }
-    if (path.empty()) { usage(); return 2; }
+    if (opt.path.empty()) { usage(); return 2; }
     try {
-        auto img = pe::Image::loadFile(path);
+        auto img = pe::Image::loadFile(opt.path);
         printHeader(*img);
-        (void)disasm;
-        linearDisasm(*img);
+        if (opt.disasm) {
+            linearDisasm(*img);
+            return 0;
+        }
+        Program prog(std::move(img));
+        prog.discoverFunctions();
+        auto funcs = selectFunctions(prog, opt.function, false);
+        if (!opt.function.empty() && funcs.empty()) {
+            std::fprintf(stderr, "error: no function matches '%s'\n", opt.function.c_str());
+            return 1;
+        }
+        if (opt.cfg) {
+            for (Function* f : funcs) std::printf("\n%s", dumpCfg(prog, *f).c_str());
+        } else if (opt.blocks) {
+            for (Function* f : funcs) std::printf("\nFunction %s @ 0x%llx\n%s", f->name.c_str(), (unsigned long long)f->entry, dumpFunctionBlocks(*f, true).c_str());
+        } else {
+            std::printf("\n%s", dumpFunctionList(prog).c_str());
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

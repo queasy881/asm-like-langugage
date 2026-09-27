@@ -1,1 +1,5 @@
-# Test targets are added in later steps.
+file(GLOB DECOMP_UNIT_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/unit/*.cpp)
+add_executable(decomp_tests ${DECOMP_UNIT_TESTS})
+target_link_libraries(decomp_tests PRIVATE decomp_core decomp_warnings)
+target_compile_definitions(decomp_tests PRIVATE DECOMP_CORPUS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/corpus")
+add_test(NAME unit COMMAND decomp_tests)

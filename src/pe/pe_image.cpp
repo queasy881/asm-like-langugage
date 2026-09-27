@@ -560,7 +560,7 @@ void Image::parseCoffSymbols() {
         CoffSymbol sym;
         sym.name = name;
         sym.address = imageBase_ + s.virtualAddress + value;
-        sym.isFunction = ((type >> 4) & 3) == 2 || (storageClass == 2 && s.isExecutable());
+        sym.isFunction = ((type >> 4) & 3) == 2 && s.isExecutable(); // DT_FCN
         coffSymbols_.push_back(std::move(sym));
     }
 }
