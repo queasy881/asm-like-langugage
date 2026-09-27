@@ -60,7 +60,13 @@ InterpResult runFunction(const ir::Function& f, const pe::Image* img, const std:
         return true;
     };
     InterpResult r = interpret(f, mem, io);
-    if (writes) *writes = mem.writeLog;
+    if (writes) {
+        // Writes to the function's own frame are not observable by the caller,
+        // and the optimiser is entitled to remove them.
+        writes->clear();
+        for (const auto& w : mem.writeLog)
+            if (w.first < mem.stackLo || w.first >= mem.stackHi) writes->push_back(w);
+    }
     return r;
 }
 

@@ -83,7 +83,11 @@ std::string Type::spell(const std::string& declarator) const {
     }
     }
     if (decl.empty()) return base;
-    if (!decl.empty() && decl[0] == '*') return base + decl;
+    if (decl[0] == '*') {
+        size_t stars = decl.find_first_not_of('*');
+        if (stars == std::string::npos) return base + decl;   // an abstract "T*"
+        return base + decl.substr(0, stars) + " " + decl.substr(stars);
+    }
     return base + " " + decl;
 }
 

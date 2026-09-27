@@ -157,10 +157,11 @@ ExprPtr Expr::index(types::TypeRef t, ExprPtr base, ExprPtr idx) {
     return e;
 }
 ExprPtr Expr::undefined(types::TypeRef t) { return make(ExprKind::Undefined, t); }
-ExprPtr Expr::raw(types::TypeRef t, std::string text, std::vector<ExprPtr> args) {
+ExprPtr Expr::raw(types::TypeRef t, std::string text, std::vector<ExprPtr> args, bool isCall) {
     auto e = make(ExprKind::Raw, t);
     e->text = std::move(text);
     e->args = std::move(args);
+    e->rawIsCall = isCall;
     return e;
 }
 
@@ -180,6 +181,7 @@ ExprPtr Expr::clone() const {
     e->binOp = binOp;
     e->arrow = arrow;
     e->memberOffset = memberOffset;
+    e->rawIsCall = rawIsCall;
     for (const auto& a : args) e->args.push_back(a->clone());
     return e;
 }

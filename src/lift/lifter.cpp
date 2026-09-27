@@ -565,7 +565,7 @@ ValueId Lifter::flagBitValue(ir::FlagBit f) {
             ValueId b = bin(Op::Xor, flags_.lhs, flags_.result);
             return signBitSet(bin(Op::And, a, b));
         }
-        case ir::FlagPF: return intrinsic("parity8", ir::kI1, {emitTruncTo(flags_.result, 1)});
+        case ir::FlagPF: return intrinsic("_parity8", ir::kI1, {emitTruncTo(flags_.result, 1)});
         case ir::FlagAF: return intrinsic("aux_carry_sub", ir::kI1, {flags_.lhs, flags_.rhs});
         default: break;
         }
@@ -580,7 +580,7 @@ ValueId Lifter::flagBitValue(ir::FlagBit f) {
             ValueId b = bin(Op::Xor, flags_.rhs, flags_.result);
             return signBitSet(bin(Op::And, a, b));
         }
-        case ir::FlagPF: return intrinsic("parity8", ir::kI1, {emitTruncTo(flags_.result, 1)});
+        case ir::FlagPF: return intrinsic("_parity8", ir::kI1, {emitTruncTo(flags_.result, 1)});
         case ir::FlagAF: return intrinsic("aux_carry_add", ir::kI1, {flags_.lhs, flags_.rhs});
         default: break;
         }
@@ -590,7 +590,7 @@ ValueId Lifter::flagBitValue(ir::FlagBit f) {
         case ir::FlagZF: return cmp(Op::CmpEq, flags_.result, zero);
         case ir::FlagSF: return signBitSet(flags_.result);
         case ir::FlagCF: case ir::FlagOF: return boolConst(false);
-        case ir::FlagPF: return intrinsic("parity8", ir::kI1, {emitTruncTo(flags_.result, 1)});
+        case ir::FlagPF: return intrinsic("_parity8", ir::kI1, {emitTruncTo(flags_.result, 1)});
         case ir::FlagAF: return undef(ir::kI1);
         default: break;
         }
@@ -605,7 +605,7 @@ ValueId Lifter::flagBitValue(ir::FlagBit f) {
             return cmp(Op::CmpEq, flags_.result,
                        konstLike(flags_.result, flags_.op == FlagOp::Inc ? (1ull << (t.bits - 1))
                                                                          : maskBits(t.bits - 1)));
-        case ir::FlagPF: return intrinsic("parity8", ir::kI1, {emitTruncTo(flags_.result, 1)});
+        case ir::FlagPF: return intrinsic("_parity8", ir::kI1, {emitTruncTo(flags_.result, 1)});
         case ir::FlagAF: return undef(ir::kI1);
         default: break;
         }
@@ -616,7 +616,7 @@ ValueId Lifter::flagBitValue(ir::FlagBit f) {
         case ir::FlagCF: return cmp(Op::CmpNe, flags_.lhs, konstLike(flags_.lhs, 0));
         case ir::FlagSF: return signBitSet(flags_.result);
         case ir::FlagOF: return cmp(Op::CmpEq, flags_.lhs, konstLike(flags_.lhs, 1ull << (t.bits - 1)));
-        case ir::FlagPF: return intrinsic("parity8", ir::kI1, {emitTruncTo(flags_.result, 1)});
+        case ir::FlagPF: return intrinsic("_parity8", ir::kI1, {emitTruncTo(flags_.result, 1)});
         default: break;
         }
         break;
@@ -624,7 +624,7 @@ ValueId Lifter::flagBitValue(ir::FlagBit f) {
         switch (f) {
         case ir::FlagZF: return cmp(Op::CmpEq, flags_.result, zero);
         case ir::FlagSF: return signBitSet(flags_.result);
-        case ir::FlagPF: return intrinsic("parity8", ir::kI1, {emitTruncTo(flags_.result, 1)});
+        case ir::FlagPF: return intrinsic("_parity8", ir::kI1, {emitTruncTo(flags_.result, 1)});
         default: break;
         }
         break;
@@ -1036,7 +1036,7 @@ bool Lifter::liftShift(const Instruction& in) {
         ValueId a = readOperand(in, 0);
         ValueId c = shiftCount(a);
         ValueId cf = zeroExtendBool(flagBitValue(ir::FlagCF), typeOf(a));
-        ValueId r = intrinsic(in.mnem == Mnem::Rcl ? "rotate_carry_left" : "rotate_carry_right", typeOf(a), {a, c, cf});
+        ValueId r = intrinsic(in.mnem == Mnem::Rcl ? "_rotl_carry" : "_rotr_carry", typeOf(a), {a, c, cf});
         writeOperand(in, 0, r);
         setFlagBit(ir::FlagCF, undef(ir::kI1));
         setFlagBit(ir::FlagOF, undef(ir::kI1));
@@ -1204,7 +1204,7 @@ bool Lifter::liftBits(const Instruction& in) {
     case Mnem::Bsf:
     case Mnem::Tzcnt: {
         ValueId a = readOperand(in, 1);
-        ValueId r = intrinsic("count_trailing_zeros", typeOf(a), {a});
+        ValueId r = intrinsic("_tzcnt_u32", typeOf(a), {a});
         writeOperand(in, 0, emitTruncTo(r, in.ops[0].size));
         setFlagsUnknown(kFlagsArith);
         setFlagBit(ir::FlagZF, cmp(Op::CmpEq, a, konstLike(a, 0)));
@@ -1212,7 +1212,7 @@ bool Lifter::liftBits(const Instruction& in) {
     }
     case Mnem::Bsr: {
         ValueId a = readOperand(in, 1);
-        ValueId r = intrinsic("bit_scan_reverse", typeOf(a), {a});
+        ValueId r = intrinsic("_bit_scan_reverse", typeOf(a), {a});
         writeOperand(in, 0, emitTruncTo(r, in.ops[0].size));
         setFlagsUnknown(kFlagsArith);
         setFlagBit(ir::FlagZF, cmp(Op::CmpEq, a, konstLike(a, 0)));
@@ -1220,14 +1220,14 @@ bool Lifter::liftBits(const Instruction& in) {
     }
     case Mnem::Lzcnt: {
         ValueId a = readOperand(in, 1);
-        ValueId r = intrinsic("count_leading_zeros", typeOf(a), {a});
+        ValueId r = intrinsic("_lzcnt_u32", typeOf(a), {a});
         writeOperand(in, 0, emitTruncTo(r, in.ops[0].size));
         setFlagsUnknown(kFlagsArith);
         return true;
     }
     case Mnem::Popcnt: {
         ValueId a = readOperand(in, 1);
-        ValueId r = intrinsic("popcount", typeOf(a), {a});
+        ValueId r = intrinsic("__popcnt", typeOf(a), {a});
         writeOperand(in, 0, emitTruncTo(r, in.ops[0].size));
         setFlagsUnknown(kFlagsArith);
         setFlagBit(ir::FlagZF, cmp(Op::CmpEq, a, konstLike(a, 0)));
@@ -1235,7 +1235,7 @@ bool Lifter::liftBits(const Instruction& in) {
     }
     case Mnem::Bswap: {
         ValueId a = readOperand(in, 0);
-        writeOperand(in, 0, intrinsic("byte_swap", typeOf(a), {a}));
+        writeOperand(in, 0, intrinsic("_byteswap", typeOf(a), {a}));
         return true;
     }
     default:

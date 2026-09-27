@@ -1,4 +1,6 @@
 #include "core/pipeline.h"
+#include <algorithm>
+#include <set>
 
 namespace dc {
 
@@ -75,6 +77,7 @@ void Pipeline::bindParameters(FunctionResult& r, unsigned ptrBytes, bool is64) {
     f.variadic() = r.signature.variadic;
 
     // Match each entry value against a parameter location.
+    std::vector<ir::ValueId> narrowed;
     for (auto& b : f.blocks()) {
         for (ir::ValueId v : b.insts) {
             ir::Inst& in = f.inst(v);
@@ -104,6 +107,33 @@ void Pipeline::bindParameters(FunctionResult& r, unsigned ptrBytes, bool is64) {
             in.loc = ir::Loc{};
             f.params()[match].value = v;
             f.params()[match].used = true;
+            narrowed.push_back(v);
+        }
+    }
+
+    // Where the recovered width is narrower than the register the value came
+    // in, the argument really is that narrow: the truncations that revealed it
+    // become no-ops and go away, so the narrow value flows on directly.
+    for (ir::ValueId v : narrowed) {
+        ir::Inst& in = f.inst(v);
+        ir::Type want = f.params()[in.aux].type;
+        if (want.isFloat() || in.type.isFloat() || want.bits >= in.type.bits) continue;
+        in.type = want;
+        std::vector<ir::ValueId> identity;
+        for (auto& b : f.blocks())
+            for (ir::ValueId u : b.insts) {
+                const ir::Inst& uu = f.inst(u);
+                if (uu.op == ir::Op::Trunc && uu.args.size() == 1 && uu.args[0] == v &&
+                    uu.type.bits == want.bits)
+                    identity.push_back(u);
+            }
+        for (ir::ValueId u : identity) f.replaceAllUses(u, v);
+        if (!identity.empty()) {
+            std::set<ir::ValueId> drop(identity.begin(), identity.end());
+            for (auto& b : f.blocks())
+                b.insts.erase(std::remove_if(b.insts.begin(), b.insts.end(),
+                                             [&](ir::ValueId u) { return drop.count(u) > 0; }),
+                              b.insts.end());
         }
     }
     (void)ptrBytes;
@@ -120,6 +150,10 @@ const winapi::DataAnalysis& Pipeline::data() {
 std::unique_ptr<FunctionResult> Pipeline::runToVariables(const Function& f) {
     auto res = runToOptimized(f);
     if (!res->ir) return res;
+
+    // Spread cheap values back to their uses so they stay expressions instead
+    // of turning into named temporaries.
+    opt::rematerializeCheapValues(*res->ir);
 
     types::TypeInference infer(prog_, types_, sigs_);
     res->types = infer.run(*res->ir, res->signature, res->frame);

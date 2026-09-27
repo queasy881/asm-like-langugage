@@ -244,25 +244,32 @@ InterpResult interpret(const ir::Function& f, InterpMemory& mem, const InterpOpt
             }
             case Op::Intrinsic: {
                 const std::string& n = in.text;
-                if (n == "byte_swap") {
+                if (n == "_rotl" || n == "_rotl64" || n == "_rotr" || n == "_rotr64") {
+                    unsigned w = argBits(0);
+                    u64 x = truncBits(a(0), w);
+                    unsigned sh = (unsigned)(a(1) & (w - 1));
+                    bool left = n == "_rotl" || n == "_rotl64";
+                    out = sh == 0 ? x : (left ? ((x << sh) | (x >> (w - sh))) : ((x >> sh) | (x << (w - sh))));
+                    out = truncBits(out, w);
+                } else if (n == "_byteswap") {
                     u64 x = a(0);
                     unsigned nb = argBits(0) / 8;
                     out = 0;
                     for (unsigned i = 0; i < nb; ++i) out |= ((x >> (i * 8)) & 0xFF) << ((nb - 1 - i) * 8);
-                } else if (n == "popcount") {
+                } else if (n == "__popcnt") {
                     out = (u64)__builtin_popcountll(truncBits(a(0), argBits(0)));
-                } else if (n == "count_trailing_zeros") {
+                } else if (n == "_tzcnt_u32") {
                     u64 x = truncBits(a(0), argBits(0));
                     out = x ? (u64)__builtin_ctzll(x) : argBits(0);
-                } else if (n == "count_leading_zeros") {
+                } else if (n == "_lzcnt_u32") {
                     u64 x = truncBits(a(0), argBits(0));
                     out = x ? (u64)(__builtin_clzll(x) - (64 - argBits(0))) : argBits(0);
-                } else if (n == "bit_scan_reverse") {
+                } else if (n == "_bit_scan_reverse") {
                     u64 x = truncBits(a(0), argBits(0));
                     out = x ? (u64)(63 - __builtin_clzll(x)) : 0;
-                } else if (n == "parity8") {
+                } else if (n == "_parity8") {
                     out = (__builtin_popcount((unsigned)(a(0) & 0xFF)) & 1) ? 0 : 1;
-                } else if (n == "rotate_carry_left" || n == "rotate_carry_right") {
+                } else if (n == "_rotl_carry" || n == "_rotr_carry") {
                     out = 0;
                 } else if (n.rfind("aux_carry", 0) == 0) {
                     out = 0;

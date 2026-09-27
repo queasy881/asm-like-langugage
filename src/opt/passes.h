@@ -50,6 +50,12 @@ int deadFrameStoreElimination(ir::Function& f);
 // which is what removes the casts left over from sub-register writes.
 int narrowByDemandedBits(ir::Function& f);
 
+// Clones cheap pure computations (width casts, small address arithmetic) down
+// to each of their uses. A value used once can be printed as an expression at
+// its use site; one used many times has to become a named variable, and a name
+// for a sign extension tells the reader nothing.
+int rematerializeCheapValues(ir::Function& f);
+
 // Runs the passes to a fixed point.
 Stats optimize(ir::Function& f, int maxRounds = 12);
 

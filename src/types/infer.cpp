@@ -23,6 +23,9 @@ void TypeInference::unite(int a, int b) {
     a = find(a);
     b = find(b);
     if (a == b) return;
+    // A pointer and an integer are never the same type. Merging them is how a
+    // length ends up declared as a pointer because it was added to one.
+    if (classFacts_[a].pointer != classFacts_[b].pointer) return;
     parent_[b] = a;
     // Merge the evidence of the two classes.
     ValueFacts& fa = classFacts_[a];
@@ -91,9 +94,11 @@ void TypeInference::seed(ir::Function& f, const Signature& sig) {
                 if (af.bits < ptrBits) af.bits = ptrBits;
                 ValueId valueSide = in.op == Op::Load ? v : in.args[1];
                 ir::Type vt = f.inst(valueSide).type;
-                // Loading a float means the pointer is to a float.
-                TypeRef pointee = vt.isFloat() ? table_.floating(vt.bits) : nullptr;
-                if (pointee && !af.pointee) af.pointee = pointee;
+                // The pointer points at whatever is read or written through it.
+                if (!af.pointee && !vt.isVoid()) {
+                    if (vt.isFloat()) af.pointee = table_.floating(vt.bits);
+                    else if (vt.bits >= 8) af.pointee = table_.integer(vt.bits, vt.bits != 8);
+                }
                 if (in.op == Op::Load) {
                     ValueFacts& lf = facts(v);
                     if (vt.isFloat()) lf.kind = Kind::Float;
@@ -208,6 +213,88 @@ void TypeInference::seed(ir::Function& f, const Signature& sig) {
 }
 
 void TypeInference::propagate(ir::Function& f) {
+    // Phase one: work out which values are pointers, to a fixed point. This
+    // has to finish before anything is united, because uniting the operands of
+    // an addition would otherwise drag the offset into the pointer's class.
+    for (int round = 0; round < 8; ++round) {
+        bool changed = false;
+        auto makePointer = [&](ValueId v, TypeRef pointee) {
+            ValueFacts& r = facts(v);
+            if (r.pointer) {
+                if (!r.pointee && pointee) r.pointee = pointee;
+                return false;
+            }
+            r.pointer = true;
+            r.kind = Kind::Pointer;
+            if (!r.pointee) r.pointee = pointee;
+            if (r.confidence < Confidence::Medium) r.confidence = Confidence::Medium;
+            return true;
+        };
+        // A phi or a select is a pointer exactly when its inputs are, and the
+        // inputs are pointers when it is.
+        for (auto& b : f.blocks()) {
+            for (ValueId v : b.insts) {
+                const ir::Inst& in = f.inst(v);
+                if (in.op != Op::Phi && in.op != Op::Select) continue;
+                size_t first = in.op == Op::Select ? 1 : 0;
+                bool anyPtr = facts(v).pointer;
+                TypeRef pointee = facts(v).pointee;
+                for (size_t i = first; i < in.args.size(); ++i) {
+                    if (in.args[i] == kNoValue) continue;
+                    if (facts(in.args[i]).pointer) {
+                        anyPtr = true;
+                        if (!pointee) pointee = facts(in.args[i]).pointee;
+                    }
+                }
+                if (!anyPtr) continue;
+                changed |= makePointer(v, pointee);
+                for (size_t i = first; i < in.args.size(); ++i) {
+                    if (in.args[i] == kNoValue) continue;
+                    if (f.inst(in.args[i]).op == Op::Const) continue; // a null literal
+                    changed |= makePointer(in.args[i], pointee);
+                }
+            }
+        }
+        for (auto& b : f.blocks()) {
+            for (ValueId v : b.insts) {
+                const ir::Inst& in = f.inst(v);
+                if ((in.op != Op::Add && in.op != Op::Sub) || in.args.size() != 2) continue;
+                bool aPtr = facts(in.args[0]).pointer;
+                bool bPtr = facts(in.args[1]).pointer;
+                if (!aPtr && !bPtr && in.op == Op::Add && facts(v).pointer) {
+                    // The sum is dereferenced, so one side carried the object
+                    // and the other was the offset into it. Whichever side
+                    // looks like an index leaves the other as the pointer.
+                    auto indexLike = [&](ValueId o) {
+                        const ir::Inst& oi = f.inst(o);
+                        if (oi.op == Op::Const) return 3;
+                        if (oi.op == Op::Mul || oi.op == Op::Shl) return 2;
+                        if (oi.op == Op::SExt || oi.op == Op::ZExt) return 2;
+                        if (oi.type.bits < prog_.pointerSize() * 8) return 1;
+                        return 0;
+                    };
+                    int sa = indexLike(in.args[0]);
+                    int sb = indexLike(in.args[1]);
+                    if (sa != sb) {
+                        ValueId base = sa > sb ? in.args[1] : in.args[0];
+                        changed |= makePointer(base, facts(v).pointee);
+                    }
+                    continue;
+                }
+                if (aPtr == bPtr) continue; // neither, or pointer difference
+                if (bPtr && in.op == Op::Sub) continue;
+                ValueFacts& r = facts(v);
+                if (r.pointer) continue;
+                r.pointer = true;
+                r.kind = Kind::Pointer;
+                if (!r.pointee) r.pointee = facts(aPtr ? in.args[0] : in.args[1]).pointee;
+                if (r.confidence < Confidence::Medium) r.confidence = Confidence::Medium;
+                changed = true;
+            }
+        }
+        if (!changed) break;
+    }
+
     // Values that must share a type.
     for (int round = 0; round < 4; ++round) {
         for (auto& b : f.blocks()) {
@@ -277,39 +364,68 @@ void TypeInference::propagate(ir::Function& f) {
 // Records the constant offsets at which each pointer root is dereferenced,
 // which is what struct recovery is built from.
 void TypeInference::collectPointerAccesses(ir::Function& f, TypeResult& out) {
-    // Resolves an address to (root value, constant offset).
-    std::function<std::pair<ValueId, i64>(ValueId, int)> resolveAddr =
-        [&](ValueId v, int depth) -> std::pair<ValueId, i64> {
-        if (depth > 16) return {v, 0};
+    // Resolves an address to the object it is inside: a base value, the
+    // constant offset within the element, and the array stride if one is
+    // being walked. Peeling the strided term is what makes every access to an
+    // array of structures land on the same base, so the fields seen through
+    // different index expressions describe one structure.
+    struct Resolved {
+        ValueId base = 0;
+        i64 offset = 0;
+        u64 stride = 0;
+    };
+    std::function<Resolved(ValueId, int)> resolveAddr = [&](ValueId v, int depth) -> Resolved {
+        if (depth > 24) return {v, 0, 0};
         const ir::Inst& in = f.inst(v);
         if (in.op == Op::Add && in.args.size() == 2) {
-            const ir::Inst& rhs = f.inst(in.args[1]);
-            if (rhs.op == Op::Const) {
-                auto base = resolveAddr(in.args[0], depth + 1);
-                return {base.first, base.second + (i64)signExtend(rhs.imm, rhs.type.bits)};
+            for (int side = 0; side < 2; ++side) {
+                const ir::Inst& term = f.inst(in.args[side]);
+                if (term.op == Op::Const) {
+                    Resolved r = resolveAddr(in.args[1 - side], depth + 1);
+                    r.offset += (i64)signExtend(term.imm, term.type.bits);
+                    return r;
+                }
             }
-            const ir::Inst& lhs = f.inst(in.args[0]);
-            if (lhs.op == Op::Const) {
-                auto base = resolveAddr(in.args[1], depth + 1);
-                return {base.first, base.second + (i64)signExtend(lhs.imm, lhs.type.bits)};
+            for (int side = 0; side < 2; ++side) {
+                const ir::Inst& term = f.inst(in.args[side]);
+                // An index scaled by a constant is a step through an array.
+                u64 stride = 0;
+                if (term.op == Op::Mul && term.args.size() == 2) {
+                    const ir::Inst& k = f.inst(term.args[1]);
+                    if (k.op == Op::Const) stride = k.imm;
+                } else if (term.op == Op::Shl && term.args.size() == 2) {
+                    const ir::Inst& k = f.inst(term.args[1]);
+                    if (k.op == Op::Const && k.imm < 32) stride = 1ull << k.imm;
+                }
+                if (stride == 0 || stride > (1u << 16)) continue;
+                Resolved r = resolveAddr(in.args[1 - side], depth + 1);
+                if (!r.stride) r.stride = stride;
+                return r;
             }
         }
         if (in.op == Op::Sub && in.args.size() == 2) {
             const ir::Inst& rhs = f.inst(in.args[1]);
             if (rhs.op == Op::Const) {
-                auto base = resolveAddr(in.args[0], depth + 1);
-                return {base.first, base.second - (i64)signExtend(rhs.imm, rhs.type.bits)};
+                Resolved r = resolveAddr(in.args[0], depth + 1);
+                r.offset -= (i64)signExtend(rhs.imm, rhs.type.bits);
+                return r;
             }
         }
         if (ir::isCast(in.op) && !in.args.empty()) return resolveAddr(in.args[0], depth + 1);
-        return {v, 0};
+        return {v, 0, 0};
     };
 
     for (auto& b : f.blocks()) {
         for (ValueId v : b.insts) {
             const ir::Inst& in = f.inst(v);
             if (in.op != Op::Load && in.op != Op::Store) continue;
-            auto [root, off] = resolveAddr(in.args[0], 0);
+            Resolved res = resolveAddr(in.args[0], 0);
+            ValueId root = res.base;
+            i64 off = res.offset;
+            if (res.stride) {
+                u64& known = out.pointerStride[root];
+                if (!known || res.stride < known) known = res.stride;
+            }
             const ir::Inst& rootIn = f.inst(root);
             // Only roots that behave like an object pointer are interesting.
             if (rootIn.op == Op::GlobalAddr || rootIn.op == Op::FrameAddr) continue;

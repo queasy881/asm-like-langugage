@@ -53,6 +53,34 @@ std::set<u32> liveInLocations(const ir::Function& f, std::map<u32, ir::Type>& ty
     return result;
 }
 
+// The smallest width a constant fits in, in bytes. Either extension counts:
+// a 32-bit move leaves the register holding a zero-extended value, and that
+// is still a 32-bit value as far as the source is concerned.
+unsigned constWidth(u64 v) {
+    for (unsigned b : {1u, 2u, 4u})
+        if (signExtend(v, b * 8) == v || truncBits(v, b * 8) == v) return b;
+    return 8;
+}
+
+// The width a value was really computed at, looking through the widening the
+// ABI applies on the way out and through the joins that merge return paths.
+unsigned effectiveIntBytes(const ir::Function& f, ValueId v, unsigned depth) {
+    const ir::Inst& in = f.inst(v);
+    if (depth < 4) {
+        if (in.op == Op::Const) return constWidth(in.imm);
+        if ((in.op == Op::ZExt || in.op == Op::SExt) && !in.args.empty())
+            return effectiveIntBytes(f, in.args[0], depth + 1);
+        if (in.op == Op::Phi || in.op == Op::Select) {
+            unsigned w = 0;
+            size_t first = in.op == Op::Select ? 1 : 0;
+            for (size_t i = first; i < in.args.size(); ++i)
+                w = std::max(w, effectiveIntBytes(f, in.args[i], depth + 1));
+            if (w) return w;
+        }
+    }
+    return in.type.bytes();
+}
+
 bool valueIsMeaningful(const ir::Function& f, ValueId v) {
     if (v == kNoValue) return false;
     const ir::Inst& in = f.inst(v);
@@ -72,9 +100,39 @@ Signature recoverSignature(Program& prog, const Function& mf, const ir::Function
     std::map<u32, ir::Type> types;
     std::set<u32> live = liveInLocations(f, types);
     auto isLive = [&](ir::Loc l) { return live.count(l.key()) > 0; };
+    // Uses of each value, so a parameter's real width can be read off the
+    // way the function consumes it.
+    std::map<ValueId, std::vector<ValueId>> uses;
+    for (const auto& b : f.blocks())
+        for (ValueId v : b.insts)
+            for (ValueId a : f.inst(v).args)
+                if (a != kNoValue) uses[a].push_back(v);
+
     auto typeOf = [&](ir::Loc l) {
         auto it = types.find(l.key());
-        return it == types.end() ? ir::Type::i((u16)(ps * 8)) : it->second;
+        ir::Type declared = it == types.end() ? ir::Type::i((u16)(ps * 8)) : it->second;
+        if (declared.isFloat() || declared.bits <= 8) return declared;
+        // The register is wide because something later in the function reuses
+        // it at that width. What the caller passed is only as wide as the
+        // reads of the incoming value.
+        unsigned widest = 0;
+        bool sawEntry = false;
+        for (const auto& b : f.blocks()) {
+            for (ValueId v : b.insts) {
+                const ir::Inst& in = f.inst(v);
+                if (in.op != Op::EntryValue || in.loc.key() != l.key()) continue;
+                sawEntry = true;
+                auto uit = uses.find(v);
+                if (uit == uses.end()) return declared;
+                for (ValueId u : uit->second) {
+                    const ir::Inst& uu = f.inst(u);
+                    if (uu.op != Op::Trunc) return declared;
+                    widest = std::max(widest, uu.type.bytes());
+                }
+            }
+        }
+        if (!sawEntry || !widest || widest * 8 >= declared.bits) return declared;
+        return ir::Type::i((u16)(widest * 8));
     };
 
     // Integer and float argument registers, in convention order. A later
@@ -207,14 +265,16 @@ Signature recoverSignature(Program& prog, const Function& mf, const ir::Function
             floatBytes = std::max(floatBytes, in.type.bytes());
         } else {
             returnsInt = true;
-            intBytes = std::max(intBytes, in.type.bytes());
+            // A value that is only widened on the way out was computed at the
+            // narrower width, and that is the width the source declared.
+            intBytes = std::max(intBytes, effectiveIntBytes(f, rv, 0));
         }
     }
     if (returnsFloat && !returnsInt) {
         sig.returnType = floatBytes == 4 ? ir::kF32 : ir::kF64;
         sig.returnsValue = true;
     } else if (returnsInt) {
-        sig.returnType = ir::Type::i((u16)(std::max(intBytes, 1u) * 8));
+        sig.returnType = ir::Type::i(intBytes > 4 ? 64 : 32);
         sig.returnsValue = true;
     } else {
         sig.returnType = ir::Type::voidTy();

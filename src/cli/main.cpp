@@ -36,6 +36,8 @@ struct Options {
     bool imports = false;
     bool structs = false;
     bool noPreamble = false;
+    std::string emitTo;
+    std::string prefix;
     bool verify = false;
     std::string function; // address or name filter
 };
@@ -60,6 +62,8 @@ void usage() {
         "  --strings           strings found in the image\n"
         "  --imports           imports, exports and recognised APIs\n"
         "  --no-preamble       omit the type alias header from the C output\n"
+        "  --emit-c <file>     write a complete compilable C file\n"
+        "  --prefix <p>        prefix recovered function names in the C output\n"
         "  --verify            run IR verification and report problems\n"
         "\n"
         "filters:\n"
@@ -138,6 +142,8 @@ int main(int argc, char** argv) {
         else if (a == "--strings") opt.strings = true;
         else if (a == "--imports") opt.imports = true;
         else if (a == "--no-preamble") opt.noPreamble = true;
+        else if (a == "--emit-c" && i + 1 < argc) opt.emitTo = argv[++i];
+        else if (a == "--prefix" && i + 1 < argc) opt.prefix = argv[++i];
         else if (a == "--verify") opt.verify = true;
         else if (a == "--function" && i + 1 < argc) opt.function = argv[++i];
         else if (!a.empty() && a[0] == '-') { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); usage(); return 2; }
@@ -300,18 +306,36 @@ int main(int argc, char** argv) {
             PipelineOptions po;
             po.verifyStages = true;
             Pipeline pipe(prog, po);
-            if (!opt.noPreamble) std::printf("%s", cgen::writePreamble().c_str());
             std::vector<const types::Type*> allStructs;
-            std::vector<std::string> bodies;
+            std::vector<std::unique_ptr<FunctionResult>> results;
+            cgen::WriterOptions wo;
+            wo.symbolPrefix = opt.prefix;
+            for (Function* f : funcs) wo.localFunctions.insert(f->name);
             for (Function* f : funcs) {
                 auto r = pipe.decompile(*f);
                 for (const types::Type* st : r->structs) allStructs.push_back(st);
-                bodies.push_back(r->code);
+                results.push_back(std::move(r));
             }
             std::sort(allStructs.begin(), allStructs.end());
             allStructs.erase(std::unique(allStructs.begin(), allStructs.end()), allStructs.end());
+            std::vector<const ast::Function*> asts;
+            for (const auto& r : results)
+                if (r->ast) asts.push_back(r->ast.get());
+            if (!opt.emitTo.empty()) {
+                std::string text = cgen::writeProgram(asts, allStructs, wo);
+                FILE* out = std::fopen(opt.emitTo.c_str(), "w");
+                if (!out) {
+                    std::fprintf(stderr, "error: cannot write %s\n", opt.emitTo.c_str());
+                    return 1;
+                }
+                std::fwrite(text.data(), 1, text.size(), out);
+                std::fclose(out);
+                std::printf("\nwrote %zu functions to %s\n", asts.size(), opt.emitTo.c_str());
+                return 0;
+            }
+            if (!opt.noPreamble) std::printf("%s", cgen::writePreamble().c_str());
             std::printf("%s", cgen::writeStructs(allStructs).c_str());
-            for (const auto& b : bodies) std::printf("\n%s", b.c_str());
+            for (const auto& r : results) std::printf("\n%s", r->code.c_str());
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());

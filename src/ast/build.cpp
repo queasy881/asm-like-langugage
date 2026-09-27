@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <set>
+#include <string>
 
 namespace dc::ast {
 
@@ -127,6 +128,9 @@ private:
     std::set<int> declaredInline_;
     std::vector<StmtPtr> topDeclarations_;
     std::set<int> needsTopDeclaration_;
+    int nextSwapTemp_ = 1;
+    std::vector<std::pair<std::string, types::TypeRef>> cycleTemporaries_;
+    std::map<size_t, std::string> replacedSource_;
 };
 
 types::TypeRef Builder::irToC(ir::Type t, bool isSigned) {
@@ -198,7 +202,11 @@ ExprPtr Builder::buildObject(ValueId addrVal, ir::Type accessType) {
         for (const auto& fl : bt->pointee->fields) {
             if ((i64)fl.offset != offset) continue;
             if (fl.size != accessType.bytes()) continue;
-            return Expr::member(fl.type, build(base), fl.name, true, fl.offset);
+            ExprPtr obj = build(base);
+            // &x[i] followed by a field is x[i].field, not (&x[i])->field.
+            if (obj->kind == ExprKind::AddrOf && obj->args[0]->kind == ExprKind::Index)
+                return Expr::member(fl.type, std::move(obj->args[0]), fl.name, false, fl.offset);
+            return Expr::member(fl.type, std::move(obj), fl.name, true, fl.offset);
         }
         return nullptr;
     };
@@ -228,6 +236,17 @@ ExprPtr Builder::buildObject(ValueId addrVal, ir::Type accessType) {
         ValueId idx = kNoValue;
         if (scaledIndex(rhs, idx)) return Expr::index(accessC, build(a.args[0]), build(idx));
         if (scaledIndex(lhs, idx)) return Expr::index(accessC, build(a.args[1]), build(idx));
+        // Byte arrays need no scale, so the index is the addend itself.
+        if (accessType.bytes() == 1) {
+            for (int side = 0; side < 2; ++side) {
+                types::TypeRef bt = types_.of(a.args[side]);
+                if (!bt || !bt->isPointer() || !bt->pointee) continue;
+                if (bt->pointee->sizeInBytes() != 1) continue;
+                types::TypeRef ot = types_.of(a.args[1 - side]);
+                if (ot && ot->isPointer()) continue;
+                return Expr::index(bt->pointee, build(a.args[side]), build(a.args[1 - side]));
+            }
+        }
     }
     if (ExprPtr m = tryMember(addrVal, 0)) return m;
 
@@ -238,11 +257,18 @@ ExprPtr Builder::buildObject(ValueId addrVal, ir::Type accessType) {
     if (a.op == Op::GlobalAddr) {
         return Expr::global(accessC, a.imm, globalName(a.imm));
     }
-    // Anything else is a plain dereference through a pointer of the right type.
+    // Anything else is a plain dereference. When the pointer already points at
+    // something of the right width, its own element type is used, so no cast
+    // is printed for what the reader can already see.
     ExprPtr base = build(addrVal);
-    types::TypeRef want = in_.typeTable->pointer(accessC);
+    types::TypeRef elem = accessC;
+    if (base->type && base->type->isPointer() && base->type->pointee &&
+        base->type->pointee->sizeInBytes() == accessType.bytes() &&
+        base->type->pointee->isFloat() == accessC->isFloat())
+        elem = base->type->pointee;
+    types::TypeRef want = in_.typeTable->pointer(elem);
     if (!sameCType(base->type, want)) base = Expr::cast(want, std::move(base));
-    return Expr::deref(accessC, std::move(base));
+    return Expr::deref(elem, std::move(base));
 }
 
 ExprPtr Builder::buildInst(const ir::Inst& in) {
@@ -316,7 +342,9 @@ ExprPtr Builder::buildInst(const ir::Inst& in) {
     case Op::Intrinsic: {
         std::vector<ExprPtr> args;
         for (ValueId a : in.args) args.push_back(build(a));
-        return Expr::raw(t, in.text, std::move(args));
+        // An operation the machine has and C does not is always written as a
+        // call, even when it takes nothing.
+        return Expr::raw(t, in.text, std::move(args), true);
     }
     case Op::Phi:
         // Resolved into edge copies; a phi should never be read directly.
@@ -351,6 +379,15 @@ ExprPtr Builder::buildInst(const ir::Inst& in) {
     if (in.args.size() == 2) {
         ExprPtr a = build(in.args[0]);
         ExprPtr b = build(in.args[1]);
+        // A literal takes the type of what it is combined with, so a mask is
+        // printed as the bit pattern it is rather than a negative number.
+        if (b->kind == ExprKind::IntConst && a->type && a->type->isInteger() && b->constName.empty()) {
+            b->type = a->type;
+            b->isSignedConst = a->type->isSigned;
+        } else if (a->kind == ExprKind::IntConst && b->type && b->type->isInteger() && a->constName.empty()) {
+            a->type = b->type;
+            a->isSignedConst = b->type->isSigned;
+        }
         types::TypeRef at = a->type;
         if (at && at->isInteger() && at->bits > 1) {
             if (isUnsignedOp(in.op) && at->isSigned) {
@@ -363,24 +400,67 @@ ExprPtr Builder::buildInst(const ir::Inst& in) {
                 t = s;
             }
         }
+        // Pointer arithmetic reads better with the pointer first.
+        if (in.op == Op::Add && b && a && b->type && a->type && b->type->isPointer() &&
+            !a->type->isPointer()) {
+            std::swap(a, b);
+            t = a->type;
+        }
+        // base + index * sizeof(element) is the address of an element.
+        if (in.op == Op::Add && a && a->type && a->type->isPointer() && a->type->pointee) {
+            unsigned esz = a->type->pointee->sizeInBytes();
+            const ir::Inst& other = f_.inst(in.args[0] == kNoValue ? in.args[1] : in.args[1]);
+            ValueId scaledValue = kNoValue;
+            for (size_t k = 0; k < in.args.size(); ++k) {
+                const ir::Inst& cand = f_.inst(in.args[k]);
+                if (cand.op != Op::Mul || cand.args.size() != 2) continue;
+                const ir::Inst& mulBy = f_.inst(cand.args[1]);
+                if (mulBy.op == Op::Const && esz && mulBy.imm == esz) scaledValue = cand.args[0];
+            }
+            (void)other;
+            if (scaledValue != kNoValue && esz > 1) {
+                // Read the types out first: the pointer is about to be moved.
+                types::TypeRef ptrType = a->type;
+                types::TypeRef elemType = a->type->pointee;
+                ExprPtr idx = build(scaledValue);
+                return Expr::addrOf(ptrType, Expr::index(elemType, std::move(a), std::move(idx)));
+            }
+        }
+        // The IR counts in bytes. Adding to a pointer whose element is larger
+        // would scale in C, so the pointer is viewed as bytes for the sum.
+        if ((in.op == Op::Add || in.op == Op::Sub) && a && a->type && a->type->isPointer() &&
+            b && b->type && !b->type->isPointer()) {
+            types::TypeRef elem = a->type->pointee;
+            unsigned esz = elem ? elem->sizeInBytes() : 1;
+            if (esz > 1) {
+                types::TypeRef bytePtr = in_.typeTable->pointer(in_.typeTable->integer(8, false));
+                a = Expr::cast(bytePtr, std::move(a));
+                t = bytePtr;
+            } else if (!elem) {
+                t = a->type;
+            }
+        }
         if (in.op == Op::Rol || in.op == Op::Ror) {
             std::vector<ExprPtr> args;
+            unsigned bits = in.type.bits;
             args.push_back(std::move(a));
             args.push_back(std::move(b));
-            return Expr::raw(t, in.op == Op::Rol ? "rotate_left" : "rotate_right", std::move(args));
+            const char* name = in.op == Op::Rol ? (bits > 32 ? "_rotl64" : "_rotl")
+                                                : (bits > 32 ? "_rotr64" : "_rotr");
+            return Expr::raw(t, name, std::move(args));
         }
         if (in.op == Op::MulHiU || in.op == Op::MulHiS) {
             std::vector<ExprPtr> args;
             args.push_back(std::move(a));
             args.push_back(std::move(b));
-            return Expr::raw(t, in.op == Op::MulHiU ? "multiply_high_unsigned" : "multiply_high", std::move(args));
+            return Expr::raw(t, in.op == Op::MulHiU ? "__umulh" : "__mulh", std::move(args), true);
         }
         return Expr::binary(t, binOpFor(in.op), std::move(a), std::move(b));
     }
     if (in.args.size() == 1) {
         std::vector<ExprPtr> args;
         args.push_back(build(in.args[0]));
-        return Expr::raw(t, ir::opName(in.op), std::move(args));
+        return Expr::raw(t, ir::opName(in.op), std::move(args), true);
     }
     return Expr::undefined(t);
 }
@@ -456,6 +536,20 @@ std::vector<StmtPtr> Builder::edgeCopies(int from, int to) {
     auto it = std::find(tb.preds.begin(), tb.preds.end(), from);
     if (it == tb.preds.end()) return out;
     size_t slot = (size_t)(it - tb.preds.begin());
+
+    // The phis of a block all read their arguments at once, so these copies
+    // are a parallel assignment. Writing them in source order is wrong
+    // whenever one copy's destination is another's source - the classic case
+    // being a loop that rotates two variables. They are ordered here, and a
+    // genuine cycle is broken with a temporary.
+    struct Copy {
+        int dstVar = -1;
+        ValueId src = ir::kNoValue;
+        int srcVar = -1;     // -1 when the source is an expression, not a variable
+        types::TypeRef type = nullptr;
+        std::string dstName;
+    };
+    std::vector<Copy> copies;
     for (ValueId v : tb.insts) {
         const ir::Inst& in = f_.inst(v);
         if (in.op != Op::Phi) break;
@@ -464,10 +558,96 @@ std::vector<StmtPtr> Builder::edgeCopies(int from, int to) {
         const Variable* dst = vars_.forValue(v);
         if (!dst) continue;
         const Variable* srcVar = vars_.forValue(src);
-        // Coalesced into the same variable: the copy is a no-op.
-        if (srcVar && srcVar->id == dst->id) continue;
-        ExprPtr value = castTo(build(src), dst->type);
-        out.push_back(Stmt::assign(varRef(*dst), std::move(value)));
+        if (srcVar && srcVar->id == dst->id) continue; // coalesced: nothing to do
+        Copy c;
+        c.dstVar = dst->id;
+        c.src = src;
+        c.srcVar = srcVar ? srcVar->id : -1;
+        c.type = dst->type;
+        c.dstName = dst->name;
+        copies.push_back(std::move(c));
+    }
+    if (copies.empty()) return out;
+
+    // A copy must be written before anything that overwrites what it reads.
+    // An expression source may read several variables, so collect them all.
+    auto sourcesOf = [&](const Copy& c) {
+        std::set<int> srcs;
+        if (c.srcVar >= 0) {
+            srcs.insert(c.srcVar);
+            return srcs;
+        }
+        std::function<void(ValueId, int)> walk = [&](ValueId v, int depth) {
+            if (depth > 32) return;
+            if (const Variable* var = vars_.forValue(v)) {
+                if (!vars_.isInlined(v)) {
+                    srcs.insert(var->id);
+                    return;
+                }
+            }
+            for (ValueId a : f_.inst(v).args)
+                if (a != kNoValue) walk(a, depth + 1);
+        };
+        walk(c.src, 0);
+        return srcs;
+    };
+
+    size_t n = copies.size();
+    std::vector<std::set<int>> srcSets(n);
+    for (size_t i = 0; i < n; ++i) srcSets[i] = sourcesOf(copies[i]);
+
+    std::vector<bool> done(n, false);
+    size_t emitted = 0;
+    while (emitted < n) {
+        bool progress = false;
+        for (size_t i = 0; i < n; ++i) {
+            if (done[i]) continue;
+            // Safe once nothing still to be written reads this destination.
+            bool blocked = false;
+            for (size_t k = 0; k < n; ++k) {
+                if (k == i || done[k]) continue;
+                if (srcSets[k].count(copies[i].dstVar)) { blocked = true; break; }
+            }
+            if (blocked) continue;
+            out.push_back(Stmt::assign(Expr::var(copies[i].type, copies[i].dstVar, copies[i].dstName),
+                                       castTo(build(copies[i].src), copies[i].type)));
+            done[i] = true;
+            ++emitted;
+            progress = true;
+        }
+        if (progress) continue;
+        // Everything left is part of a cycle: save one value aside and retry.
+        for (size_t i = 0; i < n; ++i) {
+            if (done[i]) continue;
+            std::string tmp = strfmt("swap_%d", nextSwapTemp_++);
+            cycleTemporaries_.push_back({tmp, copies[i].type});
+            out.push_back(Stmt::assign(Expr::var(copies[i].type, -1, tmp),
+                                       Expr::var(copies[i].type, copies[i].dstVar, copies[i].dstName)));
+            // Anything reading that destination now reads the saved copy.
+            for (size_t k = 0; k < n; ++k) {
+                if (done[k] || k == i) continue;
+                if (!srcSets[k].count(copies[i].dstVar)) continue;
+                if (copies[k].srcVar == copies[i].dstVar) {
+                    copies[k].srcVar = -2; // resolved through the temporary
+                    copies[k].src = kNoValue;
+                    copies[k].dstName = copies[k].dstName; // unchanged
+                    replacedSource_[k] = tmp;
+                }
+            }
+            out.push_back(Stmt::assign(Expr::var(copies[i].type, copies[i].dstVar, copies[i].dstName),
+                                       castTo(build(copies[i].src), copies[i].type)));
+            done[i] = true;
+            ++emitted;
+            for (size_t k = 0; k < n; ++k) {
+                if (done[k] || !replacedSource_.count(k)) continue;
+                out.push_back(Stmt::assign(Expr::var(copies[k].type, copies[k].dstVar, copies[k].dstName),
+                                           Expr::var(copies[k].type, -1, replacedSource_[k])));
+                done[k] = true;
+                ++emitted;
+            }
+            replacedSource_.clear();
+            break;
+        }
     }
     return out;
 }
@@ -536,6 +716,82 @@ void tidy(Stmt& s) {
         while (c && c->kind == StmtKind::Compound && c->body.size() == 1 &&
                c->body[0]->kind == StmtKind::Compound)
             c = std::move(c->body[0]);
+    }
+}
+
+// Removes assignments whose destination is never read. Member and index
+// resolution rebuilds an address from the IR, which can leave the variable
+// that held it with no readers at all.
+void removeUnreadAssignments(Function& fn) {
+    for (int pass = 0; pass < 4; ++pass) {
+        std::set<int> read;
+        std::function<void(const Expr*)> scanExpr = [&](const Expr* e) {
+            if (!e) return;
+            if (e->kind == ExprKind::VarRef && e->varId >= 0) read.insert(e->varId);
+            for (const auto& a : e->args) scanExpr(a.get());
+        };
+        std::function<void(const Stmt&)> scan = [&](const Stmt& st) {
+            if (st.kind == StmtKind::Assign) {
+                // The destination itself is not a read, but an index or a
+                // member on the left reads whatever it is built from.
+                if (st.lhs && st.lhs->kind != ExprKind::VarRef) scanExpr(st.lhs.get());
+                scanExpr(st.rhs.get());
+            } else {
+                scanExpr(st.lhs.get());
+                scanExpr(st.rhs.get());
+            }
+            scanExpr(st.expr.get());
+            scanExpr(st.declInit.get());
+            for (const auto& c : st.body) scan(*c);
+            if (st.thenBranch) scan(*st.thenBranch);
+            if (st.elseBranch) scan(*st.elseBranch);
+            if (st.loopBody) scan(*st.loopBody);
+            if (st.init) scan(*st.init);
+            if (st.step) scan(*st.step);
+            for (const auto& c : st.cases)
+                if (c.body) scan(*c.body);
+        };
+        if (fn.body) scan(*fn.body);
+
+        bool hasSideEffect = false;
+        std::function<bool(const Expr*)> effectful = [&](const Expr* e) -> bool {
+            if (!e) return false;
+            if (e->kind == ExprKind::Call) return true;
+            if (e->kind == ExprKind::Raw && !e->args.empty()) return true;
+            for (const auto& a : e->args)
+                if (effectful(a.get())) return true;
+            return false;
+        };
+        int removed = 0;
+        std::function<void(Stmt&)> prune = [&](Stmt& st) {
+            for (auto& c : st.body) if (c) prune(*c);
+            if (st.thenBranch) prune(*st.thenBranch);
+            if (st.elseBranch) prune(*st.elseBranch);
+            if (st.loopBody) prune(*st.loopBody);
+            if (st.init) prune(*st.init);
+            if (st.step) prune(*st.step);
+            for (auto& c : st.cases) if (c.body) prune(*c.body);
+            if (st.kind != StmtKind::Compound) return;
+            for (auto it = st.body.begin(); it != st.body.end();) {
+                Stmt* s2 = it->get();
+                bool drop = false;
+                if (s2->kind == StmtKind::Assign && s2->lhs && s2->lhs->kind == ExprKind::VarRef &&
+                    s2->lhs->varId >= 0 && !read.count(s2->lhs->varId) && !effectful(s2->rhs.get()))
+                    drop = true;
+                if (s2->kind == StmtKind::Decl && s2->varId >= 0 && !read.count(s2->varId) &&
+                    !effectful(s2->declInit.get()))
+                    drop = true;
+                if (drop) {
+                    it = st.body.erase(it);
+                    ++removed;
+                } else {
+                    ++it;
+                }
+            }
+        };
+        (void)hasSideEffect;
+        if (fn.body) prune(*fn.body);
+        if (!removed) break;
     }
 }
 
@@ -622,7 +878,14 @@ std::unique_ptr<Function> Builder::build() {
         }
     }
     fn->body = std::move(result.body);
+    for (const auto& [name, type] : cycleTemporaries_) {
+        bool already = false;
+        for (const auto& d : fn->declarations)
+            if (d->declName == name) already = true;
+        if (!already) fn->declarations.push_back(Stmt::decl(-1, type, name, nullptr, false));
+    }
     if (fn->body) tidy(*fn->body);
+    removeUnreadAssignments(*fn);
     // A variable that every assignment just fused away needs no declaration.
     std::set<int> stillUsed;
     std::function<void(const Stmt&)> scanStmt = [&](const Stmt& st) {

@@ -73,6 +73,7 @@ struct Expr {
     BinOp binOp = BinOp::Add;
     std::vector<ExprPtr> args;   // operands, call arguments
     bool arrow = false;          // Member: -> rather than .
+    bool rawIsCall = false;      // Raw: print as name(), even with no arguments
     u64 memberOffset = 0;
 
     static ExprPtr intConst(types::TypeRef t, u64 v, bool isSigned = true);
@@ -91,7 +92,8 @@ struct Expr {
     static ExprPtr member(types::TypeRef t, ExprPtr base, std::string field, bool arrow, u64 offset);
     static ExprPtr index(types::TypeRef t, ExprPtr base, ExprPtr idx);
     static ExprPtr undefined(types::TypeRef t);
-    static ExprPtr raw(types::TypeRef t, std::string text, std::vector<ExprPtr> args = {});
+    static ExprPtr raw(types::TypeRef t, std::string text, std::vector<ExprPtr> args = {},
+                       bool isCall = false);
 
     ExprPtr clone() const;
     bool isIntConst(u64 v) const { return kind == ExprKind::IntConst && intValue == v; }

@@ -2,6 +2,9 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cctype>
+#include <functional>
+#include <set>
 #include <sstream>
 
 namespace dc::cgen {
@@ -15,6 +18,8 @@ public:
     explicit Writer(const WriterOptions& opt) : opt_(opt) {}
 
     std::string function(const Function& fn);
+    std::string signatureOf(const Function& fn);
+    std::string applyPrefix(const std::string& name) const;
 
 private:
     void line(const std::string& s);
@@ -46,9 +51,39 @@ void Writer::closeBrace(const char* suffix) {
     line(std::string("}") + suffix);
 }
 
+// A symbol out of a binary may hold characters C does not allow in an
+// identifier, such as the dot in "t_switch.cold".
+std::string sanitizeIdentifier(const std::string& name) {
+    std::string out;
+    out.reserve(name.size());
+    for (char c : name) out += (std::isalnum((unsigned char)c) || c == '_') ? c : '_';
+    if (out.empty() || std::isdigit((unsigned char)out[0])) out.insert(out.begin(), '_');
+    return out;
+}
+
+std::string Writer::applyPrefix(const std::string& name) const {
+    std::string base = sanitizeIdentifier(name);
+    if (opt_.symbolPrefix.empty()) return base;
+    return opt_.localFunctions.count(name) ? opt_.symbolPrefix + base : base;
+}
+
 std::string Writer::declaration(types::TypeRef t, const std::string& name) {
     if (!t) return "void* " + name;
-    return t->spell(name);
+    std::string text = t->spell(name);
+    // Struct names come from the binary's own symbols and may need cleaning.
+    size_t pos = 0;
+    while ((pos = text.find("struct ", pos)) != std::string::npos) {
+        size_t start = pos + 7;
+        size_t end = start;
+        while (end < text.size() && (std::isalnum((unsigned char)text[end]) || text[end] == '_' ||
+                                     text[end] == '.' || text[end] == '$'))
+            ++end;
+        std::string raw = text.substr(start, end - start);
+        std::string clean = sanitizeIdentifier(raw);
+        text.replace(start, end - start, clean);
+        pos = start + clean.size();
+    }
+    return text;
 }
 
 std::string Writer::constant(const Expr& e) {
@@ -82,7 +117,48 @@ std::string Writer::constant(const Expr& e) {
     return s;
 }
 
+namespace {
+
+// C already performs some of these conversions on its own, so printing them
+// only adds noise. Integer promotion widens anything narrower than int to int
+// before any operation, so a cast that does exactly that says nothing.
+const Expr* stripPromotion(const Expr& e) {
+    if (e.kind != ExprKind::Cast || e.args.empty() || !e.args[0]) return &e;
+    const Expr& in = *e.args[0];
+    if (!e.type || !in.type || !e.type->isInteger() || !in.type->isInteger()) return &e;
+    if (e.type->bits == 32 && e.type->isSigned && in.type->bits < 32 && in.type->bits > 1)
+        return stripPromotion(in);
+    return &e;
+}
+
+// In a context that only consumes the bits (a store into a same-width
+// destination), a cast that changes nothing but signedness is invisible.
+const Expr* stripSameWidth(const Expr& e, unsigned destBits) {
+    const Expr* p = stripPromotion(e);
+    if (p->kind != ExprKind::Cast || p->args.empty() || !p->args[0]) return p;
+    const Expr& in = *p->args[0];
+    if (!p->type || !in.type || !p->type->isInteger() || !in.type->isInteger()) return p;
+    if (p->type->bits == in.type->bits && p->type->bits == destBits)
+        return stripSameWidth(in, destBits);
+    return p;
+}
+
+// An index is converted to the pointer's arithmetic width anyway, and the
+// conversion C picks is the one the cast was spelling out.
+const Expr* stripIndexCast(const Expr& e) {
+    const Expr* p = stripPromotion(e);
+    if (p->kind != ExprKind::Cast || p->args.empty() || !p->args[0]) return p;
+    const Expr& in = *p->args[0];
+    if (!p->type || !in.type || !p->type->isInteger() || !in.type->isInteger()) return p;
+    if (p->type->bits >= in.type->bits && p->type->isSigned == in.type->isSigned && in.type->bits > 1)
+        return stripIndexCast(in);
+    return p;
+}
+
+} // namespace
+
 std::string Writer::expr(const Expr& e, int parentPrec) {
+    if (const Expr* p = stripPromotion(e); p != &e) return expr(*p, parentPrec);
     switch (e.kind) {
     case ExprKind::IntConst:
     case ExprKind::FloatConst:
@@ -91,10 +167,11 @@ std::string Writer::expr(const Expr& e, int parentPrec) {
         return (e.wide ? "L\"" : "\"") + escapeCString(e.text) + "\"";
     case ExprKind::VarRef:
     case ExprKind::GlobalRef:
-    case ExprKind::FuncRef:
         return e.text;
+    case ExprKind::FuncRef:
+        return applyPrefix(e.text);
     case ExprKind::Raw: {
-        if (e.args.empty()) return e.text;
+        if (e.args.empty()) return e.rawIsCall ? e.text + "()" : e.text;
         std::string s = e.text + "(";
         for (size_t i = 0; i < e.args.size(); ++i) {
             if (i) s += ", ";
@@ -124,7 +201,7 @@ std::string Writer::expr(const Expr& e, int parentPrec) {
     case ExprKind::Member:
         return expr(*e.args[0], 15) + (e.arrow ? "->" : ".") + e.text;
     case ExprKind::Index:
-        return expr(*e.args[0], 15) + "[" + expr(*e.args[1], 0) + "]";
+        return expr(*e.args[0], 15) + "[" + expr(*stripIndexCast(*e.args[1]), 0) + "]";
     case ExprKind::Call: {
         std::string s = expr(*e.args[0], 15) + "(";
         for (size_t i = 1; i < e.args.size(); ++i) {
@@ -139,9 +216,33 @@ std::string Writer::expr(const Expr& e, int parentPrec) {
     }
     case ExprKind::Binary: {
         int prec = precedenceOf(e.binOp);
-        std::string lhs = expr(*e.args[0], prec);
-        std::string rhs = expr(*e.args[1], prec + 1);
-        std::string s = lhs + " " + binOpText(e.binOp) + " " + rhs;
+        // C's precedence between the bitwise and shift operators is a common
+        // source of mistakes, so those combinations are parenthesised even
+        // where the grammar does not require it.
+        auto family = [](BinOp op) {
+            switch (op) {
+            case BinOp::And: case BinOp::Or: case BinOp::Xor: return 1;
+            case BinOp::Shl: case BinOp::Shr: return 2;
+            case BinOp::Add: case BinOp::Sub: case BinOp::Mul: case BinOp::Div: case BinOp::Mod: return 3;
+            case BinOp::Eq: case BinOp::Ne: case BinOp::Lt: case BinOp::Le:
+            case BinOp::Gt: case BinOp::Ge: return 4;
+            default: return 0;
+            }
+        };
+        int mine = family(e.binOp);
+        auto side = [&](const Expr& child, int minPrec) {
+            std::string text = expr(child, minPrec);
+            if (child.kind != ExprKind::Binary) return text;
+            int theirs = family(child.binOp);
+            bool needClarity = (mine == 1 && theirs != 1 && theirs != 0) ||
+                               (mine == 2 && theirs != 2 && theirs != 0) ||
+                               (mine == 1 && theirs == 1 && child.binOp != e.binOp) ||
+                               (mine == 4 && (theirs == 1 || theirs == 2));
+            if (needClarity && !(text.size() > 1 && text.front() == '(' && text.back() == ')'))
+                return "(" + text + ")";
+            return text;
+        };
+        std::string s = side(*e.args[0], prec) + " " + binOpText(e.binOp) + " " + side(*e.args[1], prec + 1);
         return prec < parentPrec ? "(" + s + ")" : s;
     }
     }
@@ -175,13 +276,19 @@ void Writer::stmt(const Stmt& s) {
         return;
     case StmtKind::Decl: {
         std::string d = declaration(s.declType, s.declName);
-        if (s.isConst) d = "const " + d;
+        if (s.isConst && s.declType && !s.declType->isPointer()) d = "const " + d;
         if (s.declInit) d += " = " + expr(*s.declInit, 0);
         line(d + ";");
         return;
     }
     case StmtKind::Assign: {
         std::string lhs = expr(*s.lhs, 0);
+        if (s.lhs->type && s.lhs->type->isInteger()) {
+            if (const Expr* p = stripSameWidth(*s.rhs, s.lhs->type->bits); p != s.rhs.get()) {
+                line(lhs + " = " + expr(*p, 0) + ";");
+                return;
+            }
+        }
         // Print the idiomatic compound forms.
         if (s.rhs->kind == ExprKind::Binary && s.rhs->args.size() == 2) {
             const Expr& r = *s.rhs;
@@ -325,24 +432,26 @@ void Writer::stmt(const Stmt& s) {
     }
 }
 
-std::string Writer::function(const Function& fn) {
-    if (opt_.emitConfidence)
-        line(strfmt("/* confidence: %s */", types::confidenceName(fn.confidence)));
-    for (const auto& n : fn.notes) line("/* " + n + " */");
-    if (fn.gotoCount) line(strfmt("/* %d goto%s: this region has no structured form */", fn.gotoCount,
-                                  fn.gotoCount == 1 ? "" : "s"));
-
+std::string Writer::signatureOf(const Function& fn) {
     std::string sig = (fn.returnType ? fn.returnType->spell() : "void") + " ";
     if (!fn.convention.empty()) sig += fn.convention + " ";
-    sig += fn.name + "(";
+    sig += applyPrefix(fn.name) + "(";
     for (size_t i = 0; i < fn.params.size(); ++i) {
         if (i) sig += ", ";
         sig += declaration(fn.params[i].type, fn.params[i].name);
     }
     if (fn.variadic) sig += fn.params.empty() ? "..." : ", ...";
     if (fn.params.empty() && !fn.variadic) sig += "void";
-    sig += ")";
-    line(sig);
+    return sig + ")";
+}
+
+std::string Writer::function(const Function& fn) {
+    if (opt_.emitConfidence)
+        line(strfmt("/* confidence: %s */", types::confidenceName(fn.confidence)));
+    for (const auto& n : fn.notes) line("/* " + n + " */");
+    if (fn.gotoCount) line(strfmt("/* %d goto%s: this region has no structured form */", fn.gotoCount,
+                                  fn.gotoCount == 1 ? "" : "s"));
+    line(signatureOf(fn));
     openBrace();
     for (const auto& d : fn.declarations) stmt(*d);
     if (!fn.declarations.empty()) os_ << "\n";
@@ -358,12 +467,62 @@ std::string writeFunction(const Function& fn, const WriterOptions& opt) {
     return w.function(fn);
 }
 
+std::string writeDeclaration(const Function& fn, const WriterOptions& opt) {
+    Writer w(opt);
+    return w.signatureOf(fn) + ";";
+}
+
+std::string writeProgram(const std::vector<const Function*>& functions,
+                         const std::vector<const types::Type*>& structs, const WriterOptions& opt) {
+    std::ostringstream os;
+    os << writePreamble();
+    os << writeStructs(structs);
+    // Globals the recovered code refers to but that live outside it.
+    std::set<std::string> globals;
+    std::function<void(const ast::Expr*)> scanExpr = [&](const ast::Expr* e) {
+        if (!e) return;
+        if (e->kind == ast::ExprKind::GlobalRef && !e->text.empty()) globals.insert(sanitizeIdentifier(e->text));
+        for (const auto& a : e->args) scanExpr(a.get());
+    };
+    std::function<void(const ast::Stmt&)> scanStmt = [&](const ast::Stmt& st) {
+        scanExpr(st.expr.get());
+        scanExpr(st.lhs.get());
+        scanExpr(st.rhs.get());
+        scanExpr(st.declInit.get());
+        for (const auto& c : st.body) scanStmt(*c);
+        if (st.thenBranch) scanStmt(*st.thenBranch);
+        if (st.elseBranch) scanStmt(*st.elseBranch);
+        if (st.loopBody) scanStmt(*st.loopBody);
+        if (st.init) scanStmt(*st.init);
+        if (st.step) scanStmt(*st.step);
+        for (const auto& c : st.cases)
+            if (c.body) scanStmt(*c.body);
+    };
+    for (const Function* fn : functions) {
+        if (fn->body) scanStmt(*fn->body);
+        for (const auto& d : fn->declarations) scanStmt(*d);
+    }
+    std::set<std::string> defined;
+    for (const Function* fn : functions) defined.insert(sanitizeIdentifier(fn->name));
+    if (!globals.empty()) {
+        os << "/* Data outside the recovered code. */\n";
+        for (const auto& g : globals)
+            if (!defined.count(g)) os << "extern BYTE " << g << "[];\n";
+        os << "\n";
+    }
+    os << "/* Forward declarations, so the order of definitions does not matter. */\n";
+    for (const Function* fn : functions) os << writeDeclaration(*fn, opt) << "\n";
+    os << "\n";
+    for (const Function* fn : functions) os << writeFunction(*fn, opt) << "\n";
+    return os.str();
+}
+
 std::string writeStructs(const std::vector<const types::Type*>& structs) {
     std::ostringstream os;
     for (const types::Type* st : structs) {
         if (!st || st->fields.empty()) continue;
         os << "#pragma pack(push, 1)\n";
-        os << "struct " << st->name << " {\n";
+        os << "struct " << sanitizeIdentifier(st->name) << " {\n";
         for (const auto& f : st->fields) {
             os << "    " << (f.type ? f.type->spell(f.name) : "void* " + f.name) << ";";
             os << strfmt("  /* +0x%llx, %u bytes%s */", (unsigned long long)f.offset, f.size,
@@ -376,20 +535,47 @@ std::string writeStructs(const std::vector<const types::Type*>& structs) {
 }
 
 std::string writePreamble() {
-    return "/* Recovered by decomp. Types use the Windows spellings. */\n"
-           "#include <stdint.h>\n"
-           "#include <stdbool.h>\n"
-           "\n"
-           "typedef char CHAR;\n"
-           "typedef unsigned char BYTE;\n"
-           "typedef short SHORT;\n"
-           "typedef unsigned short WORD;\n"
-           "typedef int INT;\n"
-           "typedef unsigned int DWORD;\n"
-           "typedef long long LONGLONG;\n"
-           "typedef unsigned long long ULONGLONG;\n"
-           "typedef void* HANDLE;\n"
-           "\n";
+    return R"(/* Recovered by decomp. Types use the Windows spellings. */
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
+typedef char CHAR;
+typedef unsigned char BYTE;
+typedef short SHORT;
+typedef unsigned short WORD;
+typedef int INT;
+typedef unsigned int DWORD;
+typedef long long LONGLONG;
+typedef unsigned long long ULONGLONG;
+typedef void* HANDLE;
+typedef void* HWND;
+typedef void* HMODULE;
+typedef size_t SIZE_T;
+typedef long LONG;
+typedef unsigned long ULONG;
+typedef int BOOL;
+typedef unsigned short WCHAR;
+
+/* Operations the machine has and C does not. On MSVC these are intrinsics. */
+#if !defined(_MSC_VER)
+static inline DWORD _rotl(DWORD v, int n) { n &= 31; return n ? (v << n) | (v >> (32 - n)) : v; }
+static inline DWORD _rotr(DWORD v, int n) { n &= 31; return n ? (v >> n) | (v << (32 - n)) : v; }
+static inline ULONGLONG _rotl64(ULONGLONG v, int n) { n &= 63; return n ? (v << n) | (v >> (64 - n)) : v; }
+static inline ULONGLONG _rotr64(ULONGLONG v, int n) { n &= 63; return n ? (v >> n) | (v << (64 - n)) : v; }
+static inline DWORD _byteswap_ulong(DWORD v) { return __builtin_bswap32(v); }
+static inline ULONGLONG _byteswap_uint64(ULONGLONG v) { return __builtin_bswap64(v); }
+static inline LONGLONG __mulh(LONGLONG a, LONGLONG b) { return (LONGLONG)(((__int128)a * b) >> 64); }
+static inline ULONGLONG __umulh(ULONGLONG a, ULONGLONG b) { return (ULONGLONG)(((unsigned __int128)a * b) >> 64); }
+static inline DWORD __popcnt(DWORD v) { return (DWORD)__builtin_popcount(v); }
+#endif
+static inline ULONGLONG _byteswap(ULONGLONG v) { return __builtin_bswap64(v); }
+static inline DWORD _tzcnt_u32(DWORD v) { return v ? (DWORD)__builtin_ctz(v) : 32u; }
+static inline DWORD _lzcnt_u32(DWORD v) { return v ? (DWORD)__builtin_clz(v) : 32u; }
+static inline DWORD _bit_scan_reverse(DWORD v) { return v ? (DWORD)(31 - __builtin_clz(v)) : 0u; }
+static inline bool _parity8(DWORD v) { return (__builtin_popcount(v & 0xFF) & 1) == 0; }
+
+)";
 }
 
 } // namespace dc::cgen

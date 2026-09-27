@@ -14,28 +14,33 @@ set(INTEGRATION_OUT ${CMAKE_CURRENT_BINARY_DIR}/integration)
 file(MAKE_DIRECTORY ${INTEGRATION_OUT})
 set(INTEGRATION_DLLS)
 
-function(add_integration_dll cc arch opt)
+function(add_integration_dll cc arch opt src name)
   if(NOT ${cc})
     return()
   endif()
-  set(out ${INTEGRATION_OUT}/cases_${arch}_${opt}.dll)
+  set(out ${INTEGRATION_OUT}/${name}_${arch}_${opt}.dll)
   add_custom_command(OUTPUT ${out}
     COMMAND ${${cc}} -shared -${opt} -g0 -fno-asynchronous-unwind-tables
-            -DDECOMP_EXPORT -o ${out} ${CMAKE_CURRENT_SOURCE_DIR}/integration/cases.c
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/integration/cases.c
-    COMMENT "Building integration corpus ${arch} ${opt}"
+            -DDECOMP_EXPORT -o ${out} ${CMAKE_CURRENT_SOURCE_DIR}/integration/${src}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/integration/${src}
+    COMMENT "Building integration corpus ${name} ${arch} ${opt}"
     VERBATIM)
   set(INTEGRATION_DLLS ${INTEGRATION_DLLS} ${out} PARENT_SCOPE)
 endfunction()
 
-add_integration_dll(MINGW64_CC x64 O2)
-set(ALL_DLLS ${INTEGRATION_DLLS})
-add_integration_dll(MINGW64_CC x64 O0)
-list(APPEND ALL_DLLS ${INTEGRATION_DLLS})
-add_integration_dll(MINGW32_CC x86 O2)
-list(APPEND ALL_DLLS ${INTEGRATION_DLLS})
-add_integration_dll(MINGW32_CC x86 O0)
-list(APPEND ALL_DLLS ${INTEGRATION_DLLS})
+set(ALL_DLLS)
+foreach(spec "MINGW64_CC;x64" "MINGW32_CC;x86")
+  list(GET spec 0 cc)
+  list(GET spec 1 arch)
+  foreach(level O0 O2)
+    add_integration_dll(${cc} ${arch} ${level} cases.c cases)
+    list(APPEND ALL_DLLS ${INTEGRATION_DLLS})
+    add_integration_dll(${cc} ${arch} ${level} big.c big)
+    list(APPEND ALL_DLLS ${INTEGRATION_DLLS})
+    add_integration_dll(${cc} ${arch} ${level} huge.c huge)
+    list(APPEND ALL_DLLS ${INTEGRATION_DLLS})
+  endforeach()
+endforeach()
 list(REMOVE_DUPLICATES ALL_DLLS)
 
 if(ALL_DLLS)

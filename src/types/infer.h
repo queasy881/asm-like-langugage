@@ -49,6 +49,9 @@ struct TypeResult {
     std::unordered_map<ir::ValueId, Confidence> valueConfidence;
     // Accesses seen through each pointer root, used for struct recovery.
     std::unordered_map<ir::ValueId, std::vector<AccessRecord>> pointerAccesses;
+    // Stride of an array walked through that root, when one was observed. It
+    // is the size of the element, so the recovered structure is padded to it.
+    std::unordered_map<ir::ValueId, u64> pointerStride;
     Confidence overall = Confidence::Medium;
     unsigned unknownValues = 0;
 

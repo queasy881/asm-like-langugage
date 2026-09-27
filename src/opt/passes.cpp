@@ -281,6 +281,116 @@ int algebraicSimplify(ir::Function& f) {
                     if (x == y) { replaceWith(f, v, x); ++changed; continue; }
                 }
                 if (in.op == Op::Xor && x == y) { makeConst(f, v, 0); ++changed; continue; }
+                // "cmp ^ true" is a negation; invert the comparison instead.
+                if (in.op == Op::Xor && in.type.bits == 1 && isConstEq(f, y, 1)) {
+                    ir::Inst& src = f.inst(x);
+                    if (!src.dead && ir::isComparison(src.op) && ir::invertComparison(src.op) != src.op) {
+                        bool onlyUse = true;
+                        for (const auto& bb : f.blocks())
+                            for (ValueId u : bb.insts) {
+                                if (u == v) continue;
+                                for (ValueId aa : f.inst(u).args)
+                                    if (aa == x) onlyUse = false;
+                            }
+                        if (onlyUse) {
+                            src.op = ir::invertComparison(src.op);
+                            replaceWith(f, v, x);
+                            ++changed;
+                            continue;
+                        }
+                    }
+                }
+                // A shift feeding arithmetic is a multiply in disguise. Turning
+                // it back lets the chain a compiler built out of lea and shl
+                // fold into the single multiply the source wrote.
+                if ((in.op == Op::Add || in.op == Op::Sub || in.op == Op::Mul) && in.type.bits >= 16) {
+                    for (int side = 0; side < 2; ++side) {
+                        ValueId operand = in.args[side];
+                        ir::Inst& sh = f.inst(operand);
+                        if (sh.dead || sh.op != Op::Shl || sh.args.size() != 2) continue;
+                        u64 k;
+                        if (!isConst(f, sh.args[1], k) || k == 0 || k >= 32) continue;
+                        // Only when nothing else reads it, so a genuine bit
+                        // manipulation is left alone.
+                        int users = 0;
+                        for (const auto& bb : f.blocks())
+                            for (ValueId u : bb.insts)
+                                for (ValueId aa : f.inst(u).args)
+                                    if (aa == operand) ++users;
+                        if (users != 1) continue;
+                        ir::Inst nc;
+                        nc.op = Op::Const;
+                        nc.type = sh.type;
+                        nc.imm = truncBits(1ull << k, sh.type.bits);
+                        nc.addr = sh.addr;
+                        sh.args[1] = f.insertBefore(operand, std::move(nc));
+                        sh.op = Op::Mul;
+                        ++changed;
+                    }
+                }
+                // (x * c1) * c2 is one multiply.
+                if (in.op == Op::Mul) {
+                    u64 c2;
+                    if (isConst(f, y, c2)) {
+                        ir::Inst& lhs = f.inst(x);
+                        u64 c1;
+                        if (!lhs.dead && lhs.op == Op::Mul && lhs.args.size() == 2 &&
+                            isConst(f, lhs.args[1], c1)) {
+                            ir::Inst nc;
+                            nc.op = Op::Const;
+                            nc.type = in.type;
+                            nc.imm = truncBits(c1 * c2, in.type.bits);
+                            nc.addr = in.addr;
+                            ValueId nv = f.insertBefore(v, std::move(nc));
+                            in.args[0] = lhs.args[0];
+                            in.args[1] = nv;
+                            ++changed;
+                            continue;
+                        }
+                    }
+                }
+                // (x * c) + x is x * (c + 1), and the same the other way round.
+                if (in.op == Op::Add) {
+                    auto fold = [&](ValueId base, ValueId mulSide) -> bool {
+                        const ir::Inst& m = f.inst(mulSide);
+                        if (m.dead || m.op != Op::Mul || m.args.size() != 2 || m.args[0] != base) return false;
+                        u64 k;
+                        if (!isConst(f, m.args[1], k)) return false;
+                        ir::Inst nc;
+                        nc.op = Op::Const;
+                        nc.type = in.type;
+                        nc.imm = truncBits(k + 1, in.type.bits);
+                        nc.addr = in.addr;
+                        ValueId nv = f.insertBefore(v, std::move(nc));
+                        in.op = Op::Mul;
+                        in.args[0] = base;
+                        in.args[1] = nv;
+                        return true;
+                    };
+                    if (fold(x, y) || fold(y, x)) { ++changed; continue; }
+                }
+                // x + x * k is a single multiply, which is how a compiler
+                // writes it with lea and how the source wrote it.
+                if (in.op == Op::Add && f.inst(x).op != Op::Const) {
+                    auto foldSelfMul = [&](ValueId base, ValueId mulSide) -> bool {
+                        const ir::Inst& m = f.inst(mulSide);
+                        if (m.dead || m.op != Op::Mul || m.args.size() != 2) return false;
+                        if (m.args[0] != base) return false;
+                        u64 k;
+                        if (!isConst(f, m.args[1], k)) return false;
+                        ir::Inst nc;
+                        nc.op = Op::Const;
+                        nc.type = in.type;
+                        nc.imm = truncBits(k + 1, in.type.bits);
+                        nc.addr = in.addr;
+                        ValueId nv = f.insertBefore(v, std::move(nc));
+                        in.op = Op::Mul;
+                        in.args[0] = base;
+                        in.args[1] = nv;
+                        return true;
+                    };
+                    if (foldSelfMul(x, y) || foldSelfMul(y, x)) { ++changed; continue; }
+                }
                 // x + x is a doubling, which is how the source wrote it.
                 if (in.op == Op::Add && x == y && f.inst(x).op != Op::Const) {
                     ir::Inst two;
@@ -973,6 +1083,60 @@ Stats optimize(ir::Function& f, int maxRounds) {
         if (st.total() == before) break;
     }
     return st;
+}
+
+// ---------------------------------------------------------------------------
+
+int rematerializeCheapValues(ir::Function& f) {
+    auto isCheap = [&](const ir::Inst& in) {
+        switch (in.op) {
+        case Op::SExt: case Op::ZExt: case Op::Trunc: case Op::Bitcast:
+        case Op::IntToPtr: case Op::PtrToInt:
+            return in.args.size() == 1;
+        case Op::FrameAddr: case Op::GlobalAddr:
+            return true;
+        default:
+            return false;
+        }
+    };
+    int changed = 0;
+    // Work off a snapshot: the clones are cheap themselves and must not be
+    // rematerialised again.
+    std::vector<ValueId> candidates;
+    for (const auto& b : f.blocks())
+        for (ValueId v : b.insts)
+            if (isCheap(f.inst(v))) candidates.push_back(v);
+
+    auto uses = f.buildUses();
+    for (ValueId v : candidates) {
+        auto it = uses.find(v);
+        if (it == uses.end() || it->second.size() < 2) continue;
+        // Distinct users only; a user naming the value twice still needs one copy.
+        std::vector<ValueId> users;
+        for (ValueId u : it->second)
+            if (users.empty() || users.back() != u) users.push_back(u);
+        bool first = true;
+        for (ValueId u : users) {
+            ir::Inst& ui = f.inst(u);
+            if (ui.op == Op::Phi) continue;   // belongs on the edge, not here
+            if (first) { first = false; continue; }  // one user keeps the original
+            const ir::Inst& src = f.inst(v);
+            ir::Inst copy;
+            copy.op = src.op;
+            copy.type = src.type;
+            copy.args = src.args;
+            copy.imm = src.imm;
+            copy.aux = src.aux;
+            copy.loc = src.loc;
+            copy.addr = src.addr;
+            copy.block = ui.block;
+            ValueId clone = f.insertBefore(u, std::move(copy));
+            for (auto& a : f.inst(u).args)
+                if (a == v) a = clone;
+            ++changed;
+        }
+    }
+    return changed;
 }
 
 } // namespace dc::opt

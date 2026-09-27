@@ -81,10 +81,86 @@ std::vector<const Type*> recoverStructs(ir::Function& f, TypeTable& table, TypeR
             st->fields.push_back(std::move(fld));
             cursor = a.offset + (i64)a.size;
         }
+        // When the pointer walks an array, the element is exactly one stride.
+        auto strideIt = types.pointerStride.find(root);
+        if (strideIt != types.pointerStride.end() && (i64)strideIt->second > cursor) {
+            i64 target = (i64)strideIt->second;
+            while (cursor < target) {
+                i64 gap = target - cursor;
+                unsigned chunk = gap >= 8 && (cursor % 8) == 0 ? 8 : (gap >= 4 && (cursor % 4) == 0 ? 4 : (gap >= 2 && (cursor % 2) == 0 ? 2 : 1));
+                StructField pad;
+                pad.offset = (u64)cursor;
+                pad.size = chunk;
+                pad.type = table.integer(chunk * 8, false);
+                pad.name = strfmt("field_%llx", (unsigned long long)cursor);
+                pad.accessed = false;
+                st->fields.push_back(std::move(pad));
+                cursor += chunk;
+            }
+        }
         st->bits = (unsigned)cursor * 8;
         created.push_back(st);
         types.valueTypes[root] = table.pointer(st);
         types.valueConfidence[root] = Confidence::Medium;
+    }
+    // An element pointer computed as base + index * sizeof(struct) means the
+    // base is an array of that struct, so it gets the same type. Without this
+    // the array itself stays an anonymous integer.
+    bool spread = true;
+    for (int round = 0; round < 4 && spread; ++round) {
+        spread = false;
+        for (auto& b : f.blocks()) {
+            for (ValueId v : b.insts) {
+                const ir::Inst& in = f.inst(v);
+                if (in.op != Op::Add || in.args.size() != 2) continue;
+                TypeRef vt = types.valueTypes.count(v) ? types.valueTypes[v] : nullptr;
+                if (!vt || !vt->isPointer() || !vt->pointee || !vt->pointee->isStruct()) continue;
+                unsigned size = vt->pointee->sizeInBytes();
+                if (!size) continue;
+                for (int side = 0; side < 2; ++side) {
+                    const ir::Inst& other = f.inst(in.args[1 - side]);
+                    bool scaled = false;
+                    if (other.op == Op::Mul && other.args.size() == 2) {
+                        const ir::Inst& k = f.inst(other.args[1]);
+                        if (k.op == Op::Const && k.imm == size) scaled = true;
+                    }
+                    if (!scaled) continue;
+                    ValueId base = in.args[side];
+                    TypeRef bt = types.valueTypes.count(base) ? types.valueTypes[base] : nullptr;
+                    if (bt && bt->isPointer() && bt->pointee && bt->pointee->isStruct()) continue;
+                    types.valueTypes[base] = vt;
+                    types.valueConfidence[base] = Confidence::Medium;
+                    spread = true;
+                }
+            }
+        }
+        // And the other way: stepping through an array of structures by the
+        // element size gives another pointer to the same structure.
+        for (auto& b : f.blocks()) {
+            for (ValueId v : b.insts) {
+                const ir::Inst& in = f.inst(v);
+                if (in.op != Op::Add || in.args.size() != 2) continue;
+                TypeRef vt = types.valueTypes.count(v) ? types.valueTypes[v] : nullptr;
+                if (vt && vt->isPointer() && vt->pointee && vt->pointee->isStruct()) continue;
+                for (int side = 0; side < 2; ++side) {
+                    TypeRef bt = types.valueTypes.count(in.args[side]) ? types.valueTypes[in.args[side]] : nullptr;
+                    if (!bt || !bt->isPointer() || !bt->pointee || !bt->pointee->isStruct()) continue;
+                    unsigned size = bt->pointee->sizeInBytes();
+                    if (!size) continue;
+                    const ir::Inst& other = f.inst(in.args[1 - side]);
+                    bool scaled = false;
+                    if (other.op == Op::Mul && other.args.size() == 2) {
+                        const ir::Inst& k = f.inst(other.args[1]);
+                        if (k.op == Op::Const && k.imm == size) scaled = true;
+                    }
+                    if (other.op == Op::Const && size && other.imm % size == 0) scaled = true;
+                    if (!scaled) continue;
+                    types.valueTypes[v] = bt;
+                    types.valueConfidence[v] = Confidence::Medium;
+                    spread = true;
+                }
+            }
+        }
     }
     (void)ptrBits;
     std::sort(created.begin(), created.end(), [](const Type* a, const Type* b) { return a->name < b->name; });

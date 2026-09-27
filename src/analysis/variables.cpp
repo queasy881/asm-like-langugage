@@ -3,6 +3,7 @@
 #include "analysis/graph.h"
 
 #include <algorithm>
+#include <functional>
 #include <set>
 
 namespace dc {
@@ -154,38 +155,6 @@ VariableMap recoverVariables(ir::Function& f, const types::TypeResult& types, co
     for (const auto& b : f.blocks())
         for (size_t i = 0; i < b.insts.size(); ++i) pos[b.insts[i]] = (int)i;
 
-    // 1. Decide what can be an expression rather than a variable.
-    for (const auto& b : f.blocks()) {
-        for (ValueId v : b.insts) {
-            const ir::Inst& in = f.inst(v);
-            if (in.type.isVoid() || in.op == Op::Phi || in.op == Op::Arg) continue;
-            auto it = uses.find(v);
-            size_t useCount = it == uses.end() ? 0 : it->second.size();
-            // Leaves are always written out where they are used.
-            if (isCheapLeaf(in)) {
-                map.inlined.insert(v);
-                continue;
-            }
-            if (useCount != 1) continue;
-            ValueId user = it->second[0];
-            const ir::Inst& ui = f.inst(user);
-            if (ui.op == Op::Phi) continue;                 // a phi argument needs storage
-            if (ui.block != in.block) continue;             // keep it where it was computed
-            if (mayWriteMemory(in)) continue;               // calls and stores stay statements
-            if (in.op == Op::Intrinsic) continue;
-            // A load may only move down to its use if nothing writes memory in
-            // between, and nothing else reads what it reads.
-            if (in.op == Op::Load) {
-                bool blocked = false;
-                const auto& list = f.block(in.block).insts;
-                for (int i = pos[v] + 1; i < pos[user]; ++i)
-                    if (mayWriteMemory(f.inst(list[i]))) { blocked = true; break; }
-                if (blocked) continue;
-            }
-            map.inlined.insert(v);
-        }
-    }
-
     // 2. Coalesce the values that must share a variable.
     //
     // A phi and one of its arguments may share storage only when their live
@@ -234,7 +203,65 @@ VariableMap recoverVariables(ir::Function& f, const types::TypeResult& types, co
         }
     }
 
-    // 3. Create a variable per remaining class.
+
+    // 3. Decide what can stay an expression rather than becoming a variable.
+    //
+    // Inlining moves a computation down to its use, so it is only sound when
+    // nothing in between changes what that computation reads. Checking memory
+    // writes is not enough: the variables the expression reads must not be
+    // reassigned either, which happens constantly once a pointer and its
+    // increment share a name.
+    auto variableOfValue = [&](ValueId v) -> int {
+        ValueId root = co.find(v);
+        return (int)root;  // web identity is enough for the comparison below
+    };
+    for (const auto& b : f.blocks()) {
+        for (ValueId v : b.insts) {
+            const ir::Inst& in = f.inst(v);
+            if (in.type.isVoid() || in.op == Op::Phi || in.op == Op::Arg) continue;
+            auto it = uses.find(v);
+            size_t useCount = it == uses.end() ? 0 : it->second.size();
+            if (isCheapLeaf(in)) {
+                map.inlined.insert(v);
+                continue;
+            }
+            if (useCount != 1) continue;
+            ValueId user = it->second[0];
+            const ir::Inst& ui = f.inst(user);
+            if (ui.op == Op::Phi) continue;      // a phi argument needs storage
+            if (ui.block != in.block) continue;  // keep it where it was computed
+            if (mayWriteMemory(in)) continue;    // calls and stores stay statements
+            if (in.op == Op::Intrinsic) continue;
+
+            // Values the expression reads, following anything already inlined.
+            std::set<ValueId> reads;
+            std::function<void(ValueId, int)> gather = [&](ValueId x, int depth) {
+                if (depth > 32) return;
+                for (ValueId a : f.inst(x).args) {
+                    if (a == kNoValue) continue;
+                    reads.insert(a);
+                    if (map.inlined.count(a)) gather(a, depth + 1);
+                }
+            };
+            gather(v, 0);
+            std::set<int> readWebs;
+            for (ValueId r : reads) readWebs.insert(variableOfValue(r));
+
+            bool blocked = false;
+            const auto& list = f.block(in.block).insts;
+            for (int i = pos[v] + 1; i < pos[user] && !blocked; ++i) {
+                const ir::Inst& mid = f.inst(list[i]);
+                if (in.op == Op::Load && mayWriteMemory(mid)) blocked = true;
+                if (mid.type.isVoid()) continue;
+                // A value written here shares a name with something we read.
+                if (readWebs.count(variableOfValue(list[i]))) blocked = true;
+            }
+            if (blocked) continue;
+            map.inlined.insert(v);
+        }
+    }
+
+    // 4. Create a variable per remaining class.
     std::unordered_map<ValueId, int> classToVar;
     auto ensureVar = [&](ValueId v) -> int {
         ValueId root = co.find(v);
@@ -283,7 +310,7 @@ VariableMap recoverVariables(ir::Function& f, const types::TypeResult& types, co
         }
     }
 
-    // 4. Usage counts and single-assignment detection.
+    // 5. Usage counts and single-assignment detection.
     for (auto& var : map.variables) {
         var.singleAssignment = var.values.size() == 1 && !var.isParam;
         for (ValueId v : var.values) {
@@ -292,7 +319,7 @@ VariableMap recoverVariables(ir::Function& f, const types::TypeResult& types, co
         }
     }
 
-    // 5. Naming. The value that reaches a return is `result`; a pointer that a
+    // 6. Naming. The value that reaches a return is `result`; a pointer that a
     //    loop advances is `p`; a one-bit value is `flag`; parameters keep
     //    their positional names; everything else is numbered.
     std::unordered_set<int> returned;
