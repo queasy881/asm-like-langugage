@@ -91,6 +91,13 @@ private:
     bool liftMisc(const x86::Instruction& in);
     void liftCall(const x86::Instruction& in, const CallSite* cs);
     void computeStackDeltas();
+    // Registers definitely written before each block, used to tell how many
+    // arguments a call whose signature is unknown actually receives.
+    void computeDefinedRegs();
+    // Argument registers set up before `call`, as a count of the convention's
+    // leading argument registers.
+    unsigned guessArgumentCount(const x86::Instruction& call, const ConventionInfo& ci,
+                                std::vector<bool>& isFloat, std::vector<unsigned>& widths) const;
     void unsupported(const x86::Instruction& in);
     void clobberCallRegisters();
 
@@ -125,6 +132,8 @@ private:
     // Registers holding a frame address on entry to each block, and by how
     // much they differ from the stack pointer at function entry.
     std::vector<std::map<x86::Family, i64>> blockFrameRegs_;
+    std::vector<u32> blockDefinedGpr_;
+    std::vector<u32> blockDefinedXmm_;
     ValueId callResult_ = kNoValue;
     std::array<ValueId, ir::FlagCount> flagLoc_{}; // cached ReadLoc per flag
     // Machine block -> the instruction whose flags reach its entry, or null.

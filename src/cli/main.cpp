@@ -3,12 +3,16 @@
 #include "analysis/program.h"
 #include "disasm/disassembler.h"
 #include "core/pipeline.h"
+#include "cgen/cwriter.h"
+#include "winapi/api_database.h"
+#include "winapi/data_analysis.h"
 #include "lift/lifter.h"
 #include "pe/pe_image.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <string>
 
 using namespace dc;
@@ -27,6 +31,11 @@ struct Options {
     bool opt2 = false;
     bool stats = false;
     bool sigs = false;
+    bool showTypes = false;
+    bool strings = false;
+    bool imports = false;
+    bool structs = false;
+    bool noPreamble = false;
     bool verify = false;
     std::string function; // address or name filter
 };
@@ -46,6 +55,11 @@ void usage() {
         "  --opt               optimised SSA\n"
         "  --stats             per-function pipeline statistics\n"
         "  --signatures        recovered function signatures\n"
+        "  --types             recovered variables and their types\n"
+        "  --structs           recovered structure layouts\n"
+        "  --strings           strings found in the image\n"
+        "  --imports           imports, exports and recognised APIs\n"
+        "  --no-preamble       omit the type alias header from the C output\n"
         "  --verify            run IR verification and report problems\n"
         "\n"
         "filters:\n"
@@ -119,6 +133,11 @@ int main(int argc, char** argv) {
         else if (a == "--opt") opt.opt2 = true;
         else if (a == "--stats") opt.stats = true;
         else if (a == "--signatures") opt.sigs = true;
+        else if (a == "--types") opt.showTypes = true;
+        else if (a == "--structs") opt.structs = true;
+        else if (a == "--strings") opt.strings = true;
+        else if (a == "--imports") opt.imports = true;
+        else if (a == "--no-preamble") opt.noPreamble = true;
         else if (a == "--verify") opt.verify = true;
         else if (a == "--function" && i + 1 < argc) opt.function = argv[++i];
         else if (!a.empty() && a[0] == '-') { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); usage(); return 2; }
@@ -139,6 +158,45 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "error: no function matches '%s'\n", opt.function.c_str());
             return 1;
         }
+        if (opt.strings) {
+            auto data = winapi::scanStrings(prog.image());
+            std::printf("\n%zu strings\n", data.strings.size());
+            for (const auto& s : data.strings)
+                std::printf("0x%llx  %-5s %s\"%s\"\n", (unsigned long long)s.address,
+                            s.kind == winapi::StringKind::Ascii ? "ascii" : "utf16",
+                            s.inReadOnly ? "" : "(writable) ", escapeCString(s.text).c_str());
+            return 0;
+        }
+        if (opt.imports) {
+            std::printf("\nimports (%zu)\n", prog.image().imports().size());
+            std::string lastDll;
+            for (const auto& i : prog.image().imports()) {
+                if (i.dll != lastDll) {
+                    std::printf("\n  %s\n", i.dll.c_str());
+                    lastDll = i.dll;
+                }
+                const winapi::ApiSignature* api = winapi::lookup(i.name, prog.is64());
+                std::printf("    0x%llx  %-32s", (unsigned long long)i.iatAddress, i.displayName().c_str());
+                if (api) {
+                    std::printf(" %s %s(", winapi::apiTypeName(api->ret), api->name);
+                    for (size_t k = 0; k < api->params.size(); ++k)
+                        std::printf("%s%s %s", k ? ", " : "", winapi::apiTypeName(api->params[k].type),
+                                    api->params[k].name ? api->params[k].name : "");
+                    std::printf("%s)", api->variadic ? (api->params.empty() ? "..." : ", ...") : "");
+                    if (const char* d = winapi::describe(i.name)) std::printf("   /* %s */", d);
+                } else {
+                    std::printf(" /* signature unknown */");
+                }
+                if (i.delayLoad) std::printf(" [delay load]");
+                std::printf("\n");
+            }
+            std::printf("\nexports (%zu)\n", prog.image().exports().size());
+            for (const auto& e : prog.image().exports())
+                std::printf("  %-4u 0x%llx  %s%s\n", e.ordinal,
+                            (unsigned long long)prog.image().rvaToVa(e.rva), e.name.c_str(),
+                            e.forwarded ? (" -> " + e.forwarder).c_str() : "");
+            return 0;
+        }
         if (opt.sigs) {
             PipelineOptions po;
             Pipeline pipe(prog, po);
@@ -150,6 +208,37 @@ int main(int argc, char** argv) {
             }
             std::printf("\n%zu signatures, %d rounds to a fixed point\n", pipe.signatures().size(),
                         pipe.signatures().rounds());
+            return 0;
+        }
+        if (opt.showTypes || opt.structs) {
+            PipelineOptions po;
+            po.verifyStages = true;
+            Pipeline pipe(prog, po);
+            for (Function* f : funcs) {
+                auto r = pipe.runToVariables(*f);
+                if (opt.structs) {
+                    for (const types::Type* st : r->structs) {
+                        std::printf("\n#pragma pack(push, 1)\nstruct %s {\n", st->name.c_str());
+                        for (const auto& fl : st->fields)
+                            std::printf("    %-22s /* +0x%llx, %u bytes%s */\n",
+                                        (fl.type->spell(fl.name) + ";").c_str(),
+                                        (unsigned long long)fl.offset, fl.size,
+                                        fl.accessed ? "" : ", not accessed");
+                        std::printf("};\n#pragma pack(pop)\n");
+                    }
+                    continue;
+                }
+                std::printf("\n%s  /* confidence: %s */\n", f->name.c_str(),
+                            types::confidenceName(r->confidence));
+                for (const auto& why : r->confidenceReasons) std::printf("  ; %s\n", why.c_str());
+                for (const auto& var : r->variables.variables) {
+                    std::printf("  %-28s", (var.type ? var.type->spell(var.name) : "?? " + var.name).c_str());
+                    std::printf("  %u uses, %zu values%s%s\n", var.uses, var.values.size(),
+                                var.isParam ? ", parameter" : "",
+                                var.singleAssignment ? ", single assignment" : "");
+                }
+                std::printf("  (%zu values inlined as expressions)\n", r->variables.inlined.size());
+            }
             return 0;
         }
         if (opt.ssa || opt.frame || opt.opt2 || opt.stats) {
@@ -207,7 +296,22 @@ int main(int argc, char** argv) {
         } else if (opt.blocks) {
             for (Function* f : funcs) std::printf("\nFunction %s @ 0x%llx\n%s", f->name.c_str(), (unsigned long long)f->entry, dumpFunctionBlocks(*f, true).c_str());
         } else {
-            std::printf("\n%s", dumpFunctionList(prog).c_str());
+            // With no view selected, decompile to C.
+            PipelineOptions po;
+            po.verifyStages = true;
+            Pipeline pipe(prog, po);
+            if (!opt.noPreamble) std::printf("%s", cgen::writePreamble().c_str());
+            std::vector<const types::Type*> allStructs;
+            std::vector<std::string> bodies;
+            for (Function* f : funcs) {
+                auto r = pipe.decompile(*f);
+                for (const types::Type* st : r->structs) allStructs.push_back(st);
+                bodies.push_back(r->code);
+            }
+            std::sort(allStructs.begin(), allStructs.end());
+            allStructs.erase(std::unique(allStructs.begin(), allStructs.end()), allStructs.end());
+            std::printf("%s", cgen::writeStructs(allStructs).c_str());
+            for (const auto& b : bodies) std::printf("\n%s", b.c_str());
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());

@@ -100,9 +100,13 @@ std::array<u8, (size_t)Family::Count> electRegisterWidths(const Function& f, boo
                     }
                     note(ri.family, sz, ri.offset);
                 } else if (op.isMem()) {
-                    // Address registers are used at full width.
-                    if (op.mem.base != Reg::None) note(regFamily(op.mem.base), fullGpr, 0);
-                    if (op.mem.index != Reg::None) note(regFamily(op.mem.index), fullGpr, 0);
+                    // A real address is computed at full width, but lea is
+                    // arithmetic: "lea eax, [rcx+rdx]" only uses 32 bits.
+                    unsigned w = in.mnem == Mnem::Lea && in.numOps >= 1 && in.ops[0].isReg()
+                                     ? regSize(in.ops[0].reg)
+                                     : fullGpr;
+                    if (op.mem.base != Reg::None) note(regFamily(op.mem.base), w, 0);
+                    if (op.mem.index != Reg::None) note(regFamily(op.mem.index), w, 0);
                 }
             }
             // Implicit operands.
@@ -866,6 +870,12 @@ bool Lifter::liftArithmetic(const Instruction& in) {
         return true;
     }
     case Mnem::Sub: {
+        if (in.ops[0].isReg() && in.ops[1].isReg() && in.ops[0].reg == in.ops[1].reg) {
+            ValueId z = konst(intTypeForBytes(in.ops[0].size ? in.ops[0].size : pointerBytes()), 0);
+            writeOperand(in, 0, z);
+            setFlagsSub(z, z, z);
+            return true;
+        }
         ValueId a = readOperand(in, 0);
         ValueId b = emitTruncTo(readOperand(in, 1), bytesOf(a));
         i64 d = 0;
@@ -934,15 +944,17 @@ bool Lifter::liftArithmetic(const Instruction& in) {
 
 bool Lifter::liftLogic(const Instruction& in) {
     auto simple = [&](Op op) {
-        ValueId a = readOperand(in, 0);
-        ValueId b = emitTruncTo(readOperand(in, 1), bytesOf(a));
-        // xor reg, same-reg is the canonical zeroing idiom.
+        // "xor reg, same-reg" is the zeroing idiom. It must be recognised
+        // before the operand is read, or the dead read makes the register
+        // look live on entry and invents a parameter.
         if (op == Op::Xor && in.ops[0].isReg() && in.ops[1].isReg() && in.ops[0].reg == in.ops[1].reg) {
-            ValueId z = konstLike(a, 0);
+            ValueId z = konst(intTypeForBytes(in.ops[0].size ? in.ops[0].size : pointerBytes()), 0);
             writeOperand(in, 0, z);
             setFlagsLogic(z, z, z);
             return;
         }
+        ValueId a = readOperand(in, 0);
+        ValueId b = emitTruncTo(readOperand(in, 1), bytesOf(a));
         ValueId r = bin(op, a, b);
         writeOperand(in, 0, r);
         setFlagsLogic(a, b, r);
@@ -1758,6 +1770,15 @@ void Lifter::liftCall(const Instruction& in, const CallSite* cs) {
         sig.returnType = intTypeForBytes(ps);
     }
     ConventionInfo ci = conventionInfo(sig.conv == CallConv::Unknown ? defaultConvention(is64_) : sig.conv, is64_);
+    // With no signature, the arguments are whatever the caller set up. Without
+    // this an indirect call would appear to take none at all.
+    if (!sig.known) {
+        std::vector<bool> floatArg;
+        std::vector<unsigned> argWidths;
+        unsigned n = guessArgumentCount(in, ci, floatArg, argWidths);
+        for (unsigned i = 0; i < n; ++i)
+            sig.paramTypes.push_back(floatArg[i] ? ir::kF64 : intTypeForBytes(argWidths[i]));
+    }
 
     auto callInfo = std::make_unique<ir::CallInfo>();
     callInfo->target = target;
@@ -2129,6 +2150,104 @@ void Lifter::computeStackDeltas() {
     }
 }
 
+// Which registers are written on every path from the entry to each block.
+// A call whose signature is unknown still has arguments, and the registers
+// the caller set up are the only evidence of how many.
+void Lifter::computeDefinedRegs() {
+    size_t n = mf_.blocks.size();
+    blockDefinedGpr_.assign(n, 0);
+    blockDefinedXmm_.assign(n, 0);
+    std::vector<u32> outGpr(n, 0), outXmm(n, 0);
+    std::vector<char> hasOut(n, 0), hasIn(n, 0);
+    hasIn[0] = 1;
+
+    auto writesIn = [&](size_t bi, u32& gpr, u32& xmm) {
+        for (const auto& in : mf_.blocks[bi].insns) {
+            for (size_t fi = 0; fi < (size_t)Family::Count; ++fi) {
+                Family f = (Family)fi;
+                if (!instWritesFamily(in, f)) continue;
+                if (isGprFamily(f)) gpr |= 1u << gprIndex(f);
+                else if (isXmmFamily(f)) xmm |= 1u << xmmIndex(f);
+            }
+            // SSE moves write their destination register.
+            if (in.numOps >= 1 && in.ops[0].isReg() && isXmmFamily(regFamily(in.ops[0].reg)))
+                xmm |= 1u << xmmIndex(regFamily(in.ops[0].reg));
+        }
+    };
+
+    for (int round = 0; round < 8; ++round) {
+        bool changed = false;
+        for (size_t i = 0; i < n; ++i) {
+            if (!hasIn[i]) continue;
+            u32 g = blockDefinedGpr_[i], x = blockDefinedXmm_[i];
+            writesIn(i, g, x);
+            if (!hasOut[i] || outGpr[i] != g || outXmm[i] != x) {
+                outGpr[i] = g;
+                outXmm[i] = x;
+                hasOut[i] = 1;
+                changed = true;
+            }
+        }
+        for (size_t i = 0; i < n; ++i) {
+            if (i == 0) continue;
+            u32 g = 0xFFFFFFFFu, x = 0xFFFFFFFFu;
+            bool any = false;
+            for (int p : mf_.blocks[i].preds) {
+                if (!hasOut[p]) continue;
+                g &= outGpr[p];
+                x &= outXmm[p];
+                any = true;
+            }
+            if (!any) continue;
+            if (!hasIn[i] || blockDefinedGpr_[i] != g || blockDefinedXmm_[i] != x) {
+                blockDefinedGpr_[i] = g;
+                blockDefinedXmm_[i] = x;
+                hasIn[i] = 1;
+                changed = true;
+            }
+        }
+        if (!changed) break;
+    }
+}
+
+unsigned Lifter::guessArgumentCount(const Instruction& call, const ConventionInfo& ci,
+                                    std::vector<bool>& isFloat, std::vector<unsigned>& widths) const {
+    // Width the argument register was most recently written at, so a 32-bit
+    // argument is not widened to a pointer for no reason.
+    std::array<unsigned, (size_t)Family::Count> lastWidth{};
+    u32 gpr = curMachine_ < (int)blockDefinedGpr_.size() ? blockDefinedGpr_[curMachine_] : 0;
+    u32 xmm = curMachine_ < (int)blockDefinedXmm_.size() ? blockDefinedXmm_[curMachine_] : 0;
+    // Plus anything set earlier in this block.
+    for (const auto& in : mf_.blocks[curMachine_].insns) {
+        if (in.address >= call.address) break;
+        for (size_t fi = 0; fi < (size_t)Family::Count; ++fi) {
+            Family f = (Family)fi;
+            if (!instWritesFamily(in, f)) continue;
+            if (isGprFamily(f)) gpr |= 1u << gprIndex(f);
+            else if (isXmmFamily(f)) xmm |= 1u << xmmIndex(f);
+            if (in.numOps >= 1 && in.ops[0].isReg() && regFamily(in.ops[0].reg) == f)
+                lastWidth[fi] = regSize(in.ops[0].reg);
+        }
+        if (in.numOps >= 1 && in.ops[0].isReg() && isXmmFamily(regFamily(in.ops[0].reg)))
+            xmm |= 1u << xmmIndex(regFamily(in.ops[0].reg));
+    }
+    isFloat.clear();
+    widths.clear();
+    unsigned count = 0;
+    size_t maxArgs = std::max(ci.intArgRegs.size(), ci.floatArgRegs.size());
+    for (size_t i = 0; i < maxArgs; ++i) {
+        bool intSet = i < ci.intArgRegs.size() && (gpr & (1u << gprIndex(ci.intArgRegs[i])));
+        bool fltSet = ci.positionalFloatRegs && i < ci.floatArgRegs.size() &&
+                      (xmm & (1u << ci.floatArgRegs[i]));
+        if (!intSet && !fltSet) break;
+        isFloat.push_back(!intSet && fltSet);
+        unsigned w = intSet ? lastWidth[(size_t)ci.intArgRegs[i]] : 0;
+        widths.push_back(w ? w : (unsigned)pointerBytes());
+        ++count;
+    }
+    return count;
+}
+
 // A flag record only survives into a block when every predecessor leaves the
 // same defining instruction, the flags were not clobbered, and nothing has
 // changed the values that instruction compared.
@@ -2415,6 +2534,7 @@ void Lifter::emitTerminator(const BasicBlock& b) {
 
 LiftResult Lifter::run() {
     computeStackDeltas();
+    computeDefinedRegs();
     computeFlagEntryStates();
     blockMap_.assign(mf_.blocks.size(), -1);
     for (size_t i = 0; i < mf_.blocks.size(); ++i) blockMap_[i] = fn_->addBlock(mf_.blocks[i].start);

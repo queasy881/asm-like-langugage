@@ -110,7 +110,7 @@ struct CallHandler {
     InterpMemory* mem;
     bool is64;
     int depth;
-    bool operator()(const CallInfo& c, const std::vector<u64>& args, u64& ret);
+    bool operator()(const CallInfo& c, u64 resolvedTarget, const std::vector<u64>& args, u64& ret);
 };
 
 InterpResult runIr(Decompiled& d, const ir::Function& f, const pe::Image* img, bool is64,
@@ -173,7 +173,7 @@ InterpResult runIr(Decompiled& d, const ir::Function& f, const pe::Image* img, b
     return r;
 }
 
-bool CallHandler::operator()(const CallInfo& c, const std::vector<u64>& args, u64& ret) {
+bool CallHandler::operator()(const CallInfo& c, u64 resolvedTarget, const std::vector<u64>& args, u64& ret) {
     ret = 0;
     if (c.name.rfind("__chkstk", 0) == 0 || c.name.rfind("___chkstk", 0) == 0) return true;
     // Library routines the compiler substitutes for loops.
@@ -201,8 +201,9 @@ bool CallHandler::operator()(const CallInfo& c, const std::vector<u64>& args, u6
         ret = args[0];
         return true;
     }
-    if (!c.target || depth > 24) return false;
-    FunctionResult* callee = d->atAddress(c.target);
+    u64 target = c.target ? c.target : resolvedTarget;
+    if (!target || depth > 24) return false;
+    FunctionResult* callee = d->atAddress(target);
     if (!callee || !callee->ir) return false;
     // Run the callee against the same memory so its stores are visible.
     ConventionInfo ci = conventionInfo(is64 ? CallConv::Win64 : CallConv::Cdecl, is64);
@@ -361,7 +362,52 @@ TEST(integration_decompiled_code_matches_source) {
             if (t.is64) {
                 int64_t wa = (int64_t)a * 1000003, wb = (int64_t)b * 7919;
                 checkInt(d, t, "t_wide", {(u64)wa, (u64)wb}, (u64)t_wide(wa, wb), 64);
+                checkInt(d, t, "t_mul_high", {(u64)wa, (u64)wb}, (u64)t_mul_high(wa, wb), 64);
+                checkInt(d, t, "t_sign_extension",
+                         {(u64)(i64)a, (u64)(i64)(short)b, (u64)(i64)(signed char)n},
+                         (u64)t_sign_extension(a, (short)b, (signed char)n), 64);
+                checkInt(d, t, "t_zero_extension",
+                         {ua, (u64)(unsigned short)b, (u64)(unsigned char)n},
+                         t_zero_extension(ua, (unsigned short)b, (unsigned char)n), 64);
             }
+
+            // Control flow
+            checkInt(d, t, "t_early_returns", {(u64)(i64)a, (u64)(i64)b, (u64)(i64)n},
+                     (u64)(i64)t_early_returns(a, b, n), 32);
+            checkInt(d, t, "t_nested_conditions", {(u64)(i64)a, (u64)(i64)b},
+                     (u64)(i64)t_nested_conditions(a, b), 32);
+            checkInt(d, t, "t_do_while_complex", {(u64)(i64)(n % 25 + 1)},
+                     (u64)(i64)t_do_while_complex(n % 25 + 1), 32);
+            checkInt(d, t, "t_triple_nested", {(u64)(i64)(n % 8)}, (u64)(i64)t_triple_nested(n % 8), 32);
+            for (int op = 0; op <= 8; ++op)
+                checkInt(d, t, "t_switch_fallthrough", {(u64)(i64)op, (u64)(i64)a},
+                         (u64)(i64)t_switch_fallthrough(op, a), 32);
+            for (int op : {0, 1, 100, 1000, 10000, 55})
+                checkInt(d, t, "t_switch_sparse", {(u64)(i64)op}, (u64)(i64)t_switch_sparse(op), 32);
+            checkInt(d, t, "t_goto_like", {(u64)(i64)a, (u64)(i64)b}, (u64)(i64)t_goto_like(a, b), 32);
+
+            // Arithmetic
+            checkInt(d, t, "t_mixed_widths", {(u64)(i64)a, (u64)(i64)(short)b, (u64)(i64)(signed char)n},
+                     (u64)(i64)t_mixed_widths(a, (short)b, (signed char)n), 32);
+            checkInt(d, t, "t_unsigned_ops", {ua, ub}, t_unsigned_ops(ua, ub), 32);
+            checkInt(d, t, "t_div_by_constants", {(u64)(i64)a}, (u64)(i64)t_div_by_constants(a), 32);
+            checkInt(d, t, "t_udiv_by_constants", {ua}, t_udiv_by_constants(ua), 32);
+            checkInt(d, t, "t_abs_and_min_max", {(u64)(i64)a, (u64)(i64)b},
+                     (u64)(i64)t_abs_and_min_max(a, b), 32);
+            checkInt(d, t, "t_bool_logic", {(u64)(i64)a, (u64)(i64)b, (u64)(i64)n},
+                     (u64)(i64)t_bool_logic(a, b, n), 32);
+
+            // Calls
+            checkInt(d, t, "t_call_chain", {(u64)(i64)a}, (u64)(i64)t_call_chain(a), 32);
+            checkInt(d, t, "t_call_in_loop", {(u64)(i64)(n % 15)}, (u64)(i64)t_call_in_loop(n % 15), 32);
+            checkInt(d, t, "t_call_in_condition", {(u64)(i64)a}, (u64)(i64)t_call_in_condition(a), 32);
+            checkInt(d, t, "t_function_pointer", {(u64)(i64)(a & 1), (u64)(i64)b},
+                     (u64)(i64)t_function_pointer(a & 1, b), 32);
+            checkInt(d, t, "t_call_with_many",
+                     {(u64)(i64)a, (u64)(i64)b, (u64)(i64)n, 4, 5, 6, 7, 8},
+                     (u64)(i64)t_call_with_many(a, b, n, 4, 5, 6, 7, 8), 32);
+            checkInt(d, t, "t_deep_recursion", {(u64)(i64)(n % 14)},
+                     (u64)(i64)t_deep_recursion(n % 14), 32);
         }
 
         // Pointer arguments: a scratch buffer whose contents are compared after.
@@ -400,6 +446,56 @@ TEST(integration_decompiled_code_matches_source) {
             const char* txt = "integration";
             std::memcpy(s.data(), txt, std::strlen(txt) + 1);
             checkInt(d, t, "t_strlen", {kScratch}, (u64)(i64)t_strlen(txt), 32, &s);
+
+            // Structures of mixed widths, read and written.
+            {
+                std::vector<u8> win(kScratchSize, 0);
+                for (size_t i = 0; i < kScratchSize; ++i) win[i] = (u8)(i * 13 + 5);
+                struct Wide w;
+                std::memcpy(&w, win.data(), sizeof w);
+                // Keep the floating members finite so both runs agree.
+                w.e = 1.5f;
+                w.f = 2.25;
+                std::memcpy(win.data(), &w, sizeof w);
+                checkInt(d, t, "t_wide_struct", {kScratch}, (u64)(i64)t_wide_struct(&w), 32, &win);
+
+                std::vector<u8> wexpect = win;
+                struct Wide w2;
+                std::memcpy(&w2, wexpect.data(), sizeof w2);
+                t_wide_struct_write(&w2, 21);
+                std::memcpy(wexpect.data(), &w2, sizeof w2);
+                checkInt(d, t, "t_wide_struct_write", {kScratch, 21}, 0, 32, &win, &wexpect, false);
+
+                struct Point pts[8];
+                std::memcpy(pts, in.data(), sizeof pts);
+                checkInt(d, t, "t_array_of_structs", {kScratch, 8},
+                         (u64)(i64)t_array_of_structs(pts, 8), 32, &in);
+
+                int m[12];
+                std::memcpy(m, in.data(), sizeof m);
+                checkInt(d, t, "t_two_dim", {kScratch, 3, 4}, (u64)(i64)t_two_dim(m, 3, 4), 32, &in);
+
+                int arr2[16];
+                std::memcpy(arr2, in.data(), sizeof arr2);
+                checkInt(d, t, "t_loop_two_exits", {kScratch, 16, (u64)(i64)arr2[5]},
+                         (u64)(i64)t_loop_two_exits(arr2, 16, arr2[5]), 32, &in);
+                checkInt(d, t, "t_pointer_compare", {kScratch, kScratch + 16},
+                         (u64)(i64)t_pointer_compare((const int*)1, (const int*)2), 32, &in);
+
+                // A linked list built inside the scratch buffer.
+                std::vector<u8> listMem(kScratchSize, 0);
+                const u64 base = scratchAddr(t.is64);
+                unsigned nodeSize = t.is64 ? 16u : 12u;
+                for (int i = 0; i < 4; ++i) {
+                    u64 off = (u64)i * nodeSize;
+                    int value = 100 + i;
+                    std::memcpy(listMem.data() + off, &value, 4);
+                    // value, 4 bytes of padding, then the pointer.
+                    u64 next = i == 3 ? 0 : base + off + nodeSize;
+                    std::memcpy(listMem.data() + off + 8, &next, t.is64 ? 8 : 4);
+                }
+                checkInt(d, t, "t_walk_list", {base, 10}, (u64)(i64)(100 + 101 + 102 + 103), 32, &listMem);
+            }
         }
         if (g_failed != before) std::printf("    -- %s had failures\n", t.label.c_str());
     }

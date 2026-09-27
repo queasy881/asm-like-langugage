@@ -20,6 +20,7 @@ struct Stats {
     int valuesNarrowed = 0;
     int loadsForwarded = 0;
     int loadsShared = 0;
+    int deadStores = 0;
     int phisRemoved = 0;
     int rounds = 0;
 
@@ -27,7 +28,7 @@ struct Stats {
     int total() const {
         return constantsFolded + copiesPropagated + instructionsRemoved + expressionsShared +
                algebraicSimplifications + branchesSimplified + castsRemoved + valuesNarrowed +
-               loadsForwarded + loadsShared + phisRemoved;
+               loadsForwarded + loadsShared + deadStores + phisRemoved;
     }
 };
 
@@ -41,6 +42,10 @@ int forwardStackLoads(ir::Function& f);
 // Removes a load that repeats an earlier one of the same address when no
 // memory write can happen in between.
 int redundantLoadElimination(ir::Function& f);
+// Removes stores to frame slots that are never read and whose address never
+// escapes. This is what deletes callee-saved register spills, which are pure
+// prologue noise and must not reach the output.
+int deadFrameStoreElimination(ir::Function& f);
 // Rewrites values whose upper bits are never observed to their natural width,
 // which is what removes the casts left over from sub-register writes.
 int narrowByDemandedBits(ir::Function& f);

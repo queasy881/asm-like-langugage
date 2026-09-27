@@ -8,7 +8,13 @@
 #include "analysis/stack_frame.h"
 #include "ir/ir.h"
 #include "lift/lifter.h"
+#include "analysis/variables.h"
+#include "ast/build.h"
+#include "cgen/cwriter.h"
 #include "opt/passes.h"
+#include "types/struct_recovery.h"
+#include "types/type_system.h"
+#include "winapi/data_analysis.h"
 #include "ssa/ssa.h"
 
 #include <memory>
@@ -27,6 +33,13 @@ struct FunctionResult {
     StackFrame frame;
     ssa::SsaInfo ssa;
     opt::Stats optStats;
+    types::TypeResult types;
+    VariableMap variables;
+    std::vector<const types::Type*> structs;
+    types::Confidence confidence = types::Confidence::Medium;
+    std::vector<std::string> confidenceReasons;
+    std::unique_ptr<ast::Function> ast;
+    std::string code;
     CallConv convention = CallConv::Unknown;
     Signature signature;
     std::vector<std::string> unsupported;
@@ -53,11 +66,23 @@ public:
     // a stack slot where a parameter belongs.
     static void bindParameters(FunctionResult& r, unsigned ptrBytes, bool is64);
 
+    // Runs type inference, struct recovery and variable recovery.
+    std::unique_ptr<FunctionResult> runToVariables(const Function& f);
+
+    // The whole way: structuring, AST and C.
+    std::unique_ptr<FunctionResult> decompile(const Function& f);
+
+    types::TypeTable& typeTable() { return types_; }
+    const winapi::DataAnalysis& data();
+
 private:
     Program& prog_;
     PipelineOptions opt_;
     SignatureDatabase sigs_;
     bool sigsBuilt_ = false;
+    types::TypeTable types_;
+    winapi::DataAnalysis data_;
+    bool dataScanned_ = false;
 };
 
 } // namespace dc

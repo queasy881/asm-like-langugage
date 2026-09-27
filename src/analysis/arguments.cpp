@@ -1,6 +1,7 @@
 #include "analysis/arguments.h"
 
 #include "analysis/stack_frame.h"
+#include "opt/passes.h"
 #include "ssa/ssa.h"
 #include "winapi/api_database.h"
 
@@ -311,6 +312,8 @@ void SignatureDatabase::build(int maxRounds) {
             lifted.func->pruneUnreachableBlocks();
             lifted.func->recomputePreds();
             ssa::construct(*lifted.func);
+            // Dead reads would make a register look like an argument.
+            opt::deadCodeElimination(*lifted.func);
             Signature s = recoverSignature(prog_, *mf, *lifted.func, lo.convention);
             auto it = byEntry_.find(va);
             if (it == byEntry_.end() || it->second.paramTypes.size() != s.paramTypes.size() ||

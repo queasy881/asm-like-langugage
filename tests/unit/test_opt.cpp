@@ -49,7 +49,7 @@ InterpResult runFunction(const ir::Function& f, const pe::Image* img, const std:
         return true;
     };
     // Calls return a value derived from their arguments, deterministically.
-    io.onCall = [](const CallInfo& ci2, const std::vector<u64>& a, u64& ret) {
+    io.onCall = [](const CallInfo& ci2, u64, const std::vector<u64>& a, u64& ret) {
         u64 h = fnv1a64(ci2.name.data(), ci2.name.size());
         for (u64 x : a) h = (h ^ x) * 0x100000001b3ull;
         ret = h;

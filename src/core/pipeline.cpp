@@ -109,6 +109,59 @@ void Pipeline::bindParameters(FunctionResult& r, unsigned ptrBytes, bool is64) {
     (void)ptrBytes;
 }
 
+const winapi::DataAnalysis& Pipeline::data() {
+    if (!dataScanned_) {
+        data_ = winapi::scanStrings(prog_.image());
+        dataScanned_ = true;
+    }
+    return data_;
+}
+
+std::unique_ptr<FunctionResult> Pipeline::runToVariables(const Function& f) {
+    auto res = runToOptimized(f);
+    if (!res->ir) return res;
+
+    types::TypeInference infer(prog_, types_, sigs_);
+    res->types = infer.run(*res->ir, res->signature, res->frame);
+    res->structs = types::recoverStructs(*res->ir, types_, res->types, f.name, prog_.pointerSize() * 8);
+    res->variables = recoverVariables(*res->ir, res->types, res->frame);
+
+    // Overall confidence: type inference, plus everything the analysis had to
+    // give up on along the way.
+    res->confidence = res->types.overall;
+    auto lower = [&](types::Confidence c, const char* why) {
+        if (c < res->confidence) res->confidence = c;
+        res->confidenceReasons.push_back(why);
+    };
+    if (!res->unsupported.empty()) lower(types::Confidence::Low, "unsupported instructions");
+    if (f.hasUnresolvedIndirect) lower(types::Confidence::Low, "unresolved indirect jump");
+    if (f.hasDecodeErrors) lower(types::Confidence::Low, "undecodable bytes");
+    if (res->frame.anyEscaped) lower(types::Confidence::Medium, "a frame address escapes");
+    if (!res->problems.empty()) lower(types::Confidence::Low, "verification problems");
+    return res;
+}
+
+std::unique_ptr<FunctionResult> Pipeline::decompile(const Function& f) {
+    auto res = runToVariables(f);
+    if (!res->ir) return res;
+    ast::BuildInputs bi;
+    bi.prog = &prog_;
+    bi.ir = res->ir.get();
+    bi.variables = &res->variables;
+    bi.types = &res->types;
+    bi.signature = &res->signature;
+    bi.frame = &res->frame;
+    bi.typeTable = &types_;
+    bi.data = &data();
+    bi.signatures = &sigs_;
+    bi.confidence = res->confidence;
+    bi.notes = res->confidenceReasons;
+    res->ast = ast::buildFunction(bi);
+    cgen::WriterOptions wo;
+    res->code = cgen::writeFunction(*res->ast, wo);
+    return res;
+}
+
 std::unique_ptr<FunctionResult> Pipeline::runToOptimized(const Function& f) {
     auto res = runToSsa(f);
     if (opt_.optimize) {

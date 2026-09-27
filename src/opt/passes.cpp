@@ -281,6 +281,18 @@ int algebraicSimplify(ir::Function& f) {
                     if (x == y) { replaceWith(f, v, x); ++changed; continue; }
                 }
                 if (in.op == Op::Xor && x == y) { makeConst(f, v, 0); ++changed; continue; }
+                // x + x is a doubling, which is how the source wrote it.
+                if (in.op == Op::Add && x == y && f.inst(x).op != Op::Const) {
+                    ir::Inst two;
+                    two.op = Op::Const;
+                    two.type = in.type;
+                    two.imm = 2;
+                    two.addr = in.addr;
+                    in.op = Op::Mul;
+                    in.args[1] = f.insertBefore(v, std::move(two));
+                    ++changed;
+                    continue;
+                }
                 if (in.op == Op::Sub && x == y) { makeConst(f, v, 0); ++changed; continue; }
                 // x - c  ->  x + (-c) keeps additive chains in one shape.
                 if (in.op == Op::Sub) {
@@ -331,6 +343,23 @@ int algebraicSimplify(ir::Function& f) {
                     if (isConst(f, y, c) && !ot.isFloat()) {
                         if (in.op == Op::CmpUlt && c == 0) { makeConst(f, v, 0); ++changed; continue; }
                         if (in.op == Op::CmpUge && c == 0) { makeConst(f, v, 1); ++changed; continue; }
+                        // "x >= k+1" is how a compiler writes "x > k".
+                        unsigned bits = ot.bits;
+                        i64 sc = signExtend(c, bits);
+                        auto retarget = [&](Op newOp, i64 newC) {
+                            ir::Inst nc;
+                            nc.op = Op::Const;
+                            nc.type = ot;
+                            nc.imm = truncBits((u64)newC, bits);
+                            nc.addr = in.addr;
+                            in.args[1] = f.insertBefore(v, std::move(nc));
+                            in.op = newOp;
+                            ++changed;
+                        };
+                        if (in.op == Op::CmpSge && sc != INT64_MIN) { retarget(Op::CmpSgt, sc - 1); continue; }
+                        if (in.op == Op::CmpSlt && sc != INT64_MIN) { retarget(Op::CmpSle, sc - 1); continue; }
+                        if (in.op == Op::CmpUge && c > 0) { retarget(Op::CmpUgt, (i64)(c - 1)); continue; }
+                        if (in.op == Op::CmpUlt && c > 0) { retarget(Op::CmpUle, (i64)(c - 1)); continue; }
                     }
                 }
             }
@@ -658,6 +687,44 @@ int redundantLoadElimination(ir::Function& f) {
     return changed;
 }
 
+int deadFrameStoreElimination(ir::Function& f) {
+    // A frame offset qualifies when every use of its address is a direct load
+    // or store, so nothing else can reach it.
+    std::map<i64, bool> escaped;
+    std::map<i64, unsigned> loads;
+    std::map<i64, std::vector<ValueId>> stores;
+    auto uses = f.buildUses();
+
+    for (const auto& b : f.blocks()) {
+        for (ValueId v : b.insts) {
+            const ir::Inst& in = f.inst(v);
+            if (in.dead || in.op != Op::FrameAddr) continue;
+            i64 off = (i64)in.imm;
+            escaped.emplace(off, false);
+            auto it = uses.find(v);
+            if (it == uses.end()) continue;
+            for (ValueId u : it->second) {
+                const ir::Inst& ui = f.inst(u);
+                if (ui.dead) continue;
+                if (ui.op == Op::Load && ui.args[0] == v) ++loads[off];
+                else if (ui.op == Op::Store && ui.args[0] == v && ui.args[1] != v) stores[off].push_back(u);
+                else escaped[off] = true;
+            }
+        }
+    }
+    int removed = 0;
+    for (auto& [off, list] : stores) {
+        if (escaped[off]) continue;
+        if (loads.count(off) && loads[off] > 0) continue;
+        for (ValueId v : list) {
+            f.inst(v).dead = true;
+            ++removed;
+        }
+    }
+    if (removed) f.removeDeadInsts();
+    return removed;
+}
+
 // --- demanded bits ---------------------------------------------------------
 
 int narrowByDemandedBits(ir::Function& f) {
@@ -900,6 +967,7 @@ Stats optimize(ir::Function& f, int maxRounds) {
         st.loadsForwarded += forwardStackLoads(f);
         st.expressionsShared += commonSubexpressionElimination(f);
         st.loadsShared += redundantLoadElimination(f);
+        st.deadStores += deadFrameStoreElimination(f);
         st.castsRemoved += narrowByDemandedBits(f);
         st.instructionsRemoved += deadCodeElimination(f);
         if (st.total() == before) break;

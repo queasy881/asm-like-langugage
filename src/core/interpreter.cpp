@@ -232,8 +232,10 @@ InterpResult interpret(const ir::Function& f, InterpMemory& mem, const InterpOpt
                 std::vector<u64> args;
                 size_t start = in.aux ? 1 : 0;
                 for (size_t i = start; i < in.args.size(); ++i) args.push_back(a(i));
+                u64 target = in.call ? in.call->target : 0;
+                if (in.aux && !in.args.empty()) target = a(0);
                 u64 ret = 0;
-                if (!opt.onCall || !opt.onCall(*in.call, args, ret)) {
+                if (!opt.onCall || !opt.onCall(*in.call, target, args, ret)) {
                     res.error = "call not handled: " + (in.call ? in.call->name : std::string("<indirect>"));
                     return res;
                 }

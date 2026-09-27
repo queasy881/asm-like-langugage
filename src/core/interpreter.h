@@ -31,8 +31,10 @@ struct InterpOptions {
     u64 stackBase = 0x7FF000000000ull;  // value of the stack pointer on entry
     u64 maxSteps = 2000000;
     bool trapOnUndef = false;
-    // Called for every Call instruction. Return false to trap.
-    std::function<bool(const ir::CallInfo&, const std::vector<u64>&, u64&)> onCall;
+    // Called for every Call instruction. `resolvedTarget` is the computed
+    // callee address for an indirect call, or the static target otherwise.
+    // Return false to trap.
+    std::function<bool(const ir::CallInfo&, u64 resolvedTarget, const std::vector<u64>&, u64&)> onCall;
     // Initial value for a location read on entry (registers, flags).
     std::function<bool(ir::Loc, u64&)> entryValue;
     // Value of parameter `index`. Used for Arg nodes, which the pipeline
