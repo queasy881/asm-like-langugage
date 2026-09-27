@@ -237,6 +237,58 @@ int constantFold(ir::Function& f) {
     return changed;
 }
 
+// Pushes a negation inwards so it lands on the comparisons, where it reads as
+// the opposite test rather than as a bang in front of a parenthesised chain.
+int simplifyBoolNot(ir::Function& f) {
+    int changed = 0;
+    for (int round = 0; round < 8; ++round) {
+        int before = changed;
+        for (auto& b : f.blocks()) {
+            for (ValueId v : b.insts) {
+                ir::Inst& in = f.inst(v);
+                if (in.dead || in.op != Op::Not || in.type.bits != 1 || in.args.size() != 1) continue;
+                ValueId a = in.args[0];
+                const ir::Inst& src = f.inst(a);
+                if (src.dead) continue;
+                if (ir::isComparison(src.op) && ir::invertComparison(src.op) != src.op) {
+                    in.op = ir::invertComparison(src.op);
+                    in.args = src.args;
+                    ++changed;
+                    continue;
+                }
+                if (src.op == Op::Not && src.args.size() == 1 && src.type.bits == 1) {
+                    f.replaceAllUses(v, src.args[0]);
+                    in.dead = true;
+                    ++changed;
+                    continue;
+                }
+                if ((src.op == Op::And || src.op == Op::Or) && src.type.bits == 1 &&
+                    src.args.size() == 2) {
+                    ValueId sa = src.args[0], sb = src.args[1];
+                    auto negate = [&](ValueId x) {
+                        ir::Inst n;
+                        n.op = Op::Not;
+                        n.type = ir::kI1;
+                        n.args.assign(1, x);
+                        n.addr = in.addr;
+                        n.block = in.block;
+                        return f.insertBefore(v, std::move(n));
+                    };
+                    ValueId na = negate(sa);
+                    ValueId nb = negate(sb);
+                    ir::Inst& self = f.inst(v);
+                    self.op = f.inst(a).op == Op::And ? Op::Or : Op::And;
+                    self.args = {na, nb};
+                    ++changed;
+                    continue;
+                }
+            }
+        }
+        if (changed == before) break;
+    }
+    return changed;
+}
+
 int algebraicSimplify(ir::Function& f) {
     int changed = 0;
     for (auto& b : f.blocks()) {
@@ -1072,6 +1124,7 @@ Stats optimize(ir::Function& f, int maxRounds) {
         int before = st.total();
         st.constantsFolded += constantFold(f);
         st.algebraicSimplifications += algebraicSimplify(f);
+        st.algebraicSimplifications += simplifyBoolNot(f);
         st.branchesSimplified += simplifyBranches(f);
         st.phisRemoved += ssa::simplifyPhis(f);
         st.loadsForwarded += forwardStackLoads(f);
@@ -1095,6 +1148,13 @@ int rematerializeCheapValues(ir::Function& f) {
             return in.args.size() == 1;
         case Op::FrameAddr: case Op::GlobalAddr:
             return true;
+        default:
+            break;
+        }
+        // A comparison of two already-named values is cheap to repeat and
+        // reads better inline than as a flag variable.
+        if (ir::isComparison(in.op) && in.args.size() == 2) return true;
+        switch (in.op) {
         default:
             return false;
         }

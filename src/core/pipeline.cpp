@@ -1,5 +1,6 @@
 #include "core/pipeline.h"
 #include "analysis/switch_recovery.h"
+#include "analysis/condition_folding.h"
 #include <algorithm>
 #include <cstdlib>
 #include <set>
@@ -205,6 +206,9 @@ std::unique_ptr<FunctionResult> Pipeline::runToOptimized(const Function& f) {
         // Comparison trees back into switches, then another round so the
         // now-dead comparisons go away.
         if (!getenv("DC_NO_SWITCH") && recoverSwitches(*res->ir)) opt::optimize(*res->ir, 4);
+        // Short-circuit conditions back into one expression, so the structurer
+        // sees the if / else if the source was written with.
+        if (!getenv("DC_NO_SC") && foldShortCircuits(*res->ir)) opt::optimize(*res->ir, 4);
         if (opt_.verifyStages) {
             for (const auto& e : res->ir->verify()) res->problems.push_back("opt-structure: " + e);
             for (const auto& e : ssa::verify(*res->ir)) res->problems.push_back("opt-ssa: " + e);

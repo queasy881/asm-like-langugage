@@ -55,6 +55,8 @@ int narrowByDemandedBits(ir::Function& f);
 // its use site; one used many times has to become a named variable, and a name
 // for a sign extension tells the reader nothing.
 int rematerializeCheapValues(ir::Function& f);
+// Pushes negations inwards onto the comparisons they guard.
+int simplifyBoolNot(ir::Function& f);
 
 // Runs the passes to a fixed point.
 Stats optimize(ir::Function& f, int maxRounds = 12);

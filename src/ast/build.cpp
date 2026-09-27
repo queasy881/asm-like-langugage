@@ -316,7 +316,9 @@ ExprPtr Builder::buildInst(const ir::Inst& in) {
         return buildObject(in.args[0], in.type);
     case Op::Select:
         return Expr::ternary(t, build(in.args[0]), build(in.args[1]), build(in.args[2]));
-    case Op::Not: return Expr::unary(t, UnOp::Not, build(in.args[0]));
+    case Op::Not:
+        if (in.type.bits == 1) return Expr::unary(t, UnOp::LogicalNot, build(in.args[0]));
+        return Expr::unary(t, UnOp::Not, build(in.args[0]));
     case Op::Neg: case Op::FNeg: return Expr::unary(t, UnOp::Neg, build(in.args[0]));
     case Op::Trunc: case Op::ZExt: case Op::SExt: case Op::Bitcast:
     case Op::IntToPtr: case Op::PtrToInt: case Op::FPExt: case Op::FPTrunc:
@@ -377,6 +379,12 @@ ExprPtr Builder::buildInst(const ir::Inst& in) {
         return Expr::binary(in_.typeTable->boolType(), binOpFor(in.op), std::move(a), std::move(b));
     }
     if (in.args.size() == 2) {
+        // Bitwise operations on single-bit values are the logical operators.
+        if (in.type.bits == 1 && (in.op == Op::And || in.op == Op::Or || in.op == Op::Xor)) {
+            BinOp lop = in.op == Op::And ? BinOp::LogicalAnd
+                                         : (in.op == Op::Or ? BinOp::LogicalOr : BinOp::Ne);
+            return Expr::binary(in_.typeTable->boolType(), lop, build(in.args[0]), build(in.args[1]));
+        }
         ExprPtr a = build(in.args[0]);
         ExprPtr b = build(in.args[1]);
         // A literal takes the type of what it is combined with, so a mask is

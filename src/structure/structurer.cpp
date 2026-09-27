@@ -65,11 +65,36 @@ public:
 
 private:
     // Emits blocks starting at `node`, stopping before `stopAt`.
+    // Blocks an enclosing region has claimed. A nested arm that runs into one
+    // stops there instead of pulling the shared tail inside itself, which is
+    // what turns every other path into a goto.
+    bool deferred(int b) const {
+        return std::find(deferred_.begin(), deferred_.end(), b) != deferred_.end();
+    }
+
     StmtPtr sequence(int node, int stopAt, const LoopContext& ctx) {
         std::vector<StmtPtr> out;
         int cur = node;
         int guard = 0;
-        while (cur != kNone && cur != stopAt) {
+        std::vector<int> mine;   // blocks this sequence deferred, to emit here
+        auto release = [&](int b) {
+            auto it = std::find(mine.begin(), mine.end(), b);
+            if (it == mine.end()) return false;
+            mine.erase(it);
+            deferred_.erase(std::find(deferred_.begin(), deferred_.end(), b));
+            return true;
+        };
+        while (true) {
+            if (cur == kNone || cur == stopAt) {
+                // Anything this sequence set aside still has to be written.
+                if (mine.empty()) break;
+                int next = mine.front();
+                release(next);
+                if (emitted_[next]) continue;
+                cur = next;
+            } else if (!release(cur) && deferred(cur)) {
+                break;
+            }
             if (++guard > g_.size() * 4 + 16) {
                 out.push_back(Stmt::comment("structuring gave up here"));
                 break;
@@ -121,7 +146,21 @@ private:
                 }
                 int t = b.succs[0], fls = b.succs[1];
                 int follow = chooseFollow(cur, stopAt, ctx);
+                // Where the arms really rejoin, if that is further out than
+                // the region we are about to emit. Claiming it here keeps it
+                // out of the arms.
+                int ipd = pdom_.reachable(cur) ? pdom_.idom(cur) : kNone;
+                bool claimed = false;
+                if (ipd != kNone && ipd != follow && ipd != exitNode_ && ipd != cur &&
+                    !emitted_[ipd] && !deferred(ipd) && dom_.dominates(cur, ipd) &&
+                    (ctx.loopIndex < 0 || loops_.loops[ctx.loopIndex].contains(ipd)) &&
+                    ipd != stopAt) {
+                    deferred_.push_back(ipd);
+                    mine.push_back(ipd);
+                    claimed = true;
+                }
                 out.push_back(emitIf(cur, t, fls, follow, stopAt, ctx));
+                (void)claimed;
                 cur = follow;
                 break;
             }
@@ -150,6 +189,10 @@ private:
             if (cand == kNone || cand == exitNode_ || cand == node) return false;
             if (emitted_[cand]) return false;
             if (!dom_.dominates(node, cand)) return false;
+            // Every path out of the region has to pass through the follow, or
+            // the code after it would run on paths that should have skipped
+            // it. Reachable from both arms is not the same thing.
+            if (!pdom_.dominates(cand, node)) return false;
             if (ctx.loopIndex >= 0 && !loops_.loops[ctx.loopIndex].contains(cand)) return false;
             return true;
         };
@@ -170,6 +213,8 @@ private:
         }
         return best == kNone ? stopAt : best;
     }
+
+    std::vector<int> deferred_;
 
     std::vector<bool> reachableAvoiding(int start, int avoid) {
         std::vector<bool> seen(g_.size(), false);
@@ -223,10 +268,23 @@ private:
             elseStmt = Stmt::compound(std::move(elseSeq));
             if (elseStmt->isEmpty()) elseStmt.reset();
         }
+        // A short arm belongs in the "if" and the long one in the "else",
+        // which is also the shape an if / else if chain was written in.
+        if (elseStmt && !elseEmpty) {
+            int tn = weigh(*thenStmt), en = weigh(*elseStmt);
+            if (en <= 2 && tn > en * 2) {
+                std::swap(thenStmt, elseStmt);
+                cond = invert(std::move(cond));
+            }
+        }
         // "else { if ... }" reads better as "else if".
-        if (opt_.mergeElseIf && elseStmt && elseStmt->kind == ast::StmtKind::Compound &&
-            elseStmt->body.size() == 1 && elseStmt->body[0]->kind == ast::StmtKind::If) {
-            elseStmt = std::move(elseStmt->body[0]);
+        if (opt_.mergeElseIf && elseStmt) {
+            while (elseStmt->kind == ast::StmtKind::Compound && elseStmt->body.size() == 1 &&
+                   elseStmt->body[0] && elseStmt->body[0]->kind == ast::StmtKind::Compound)
+                elseStmt = std::move(elseStmt->body[0]);
+            if (elseStmt->kind == ast::StmtKind::Compound && elseStmt->body.size() == 1 &&
+                elseStmt->body[0]->kind == ast::StmtKind::If)
+                elseStmt = std::move(elseStmt->body[0]);
         }
         return Stmt::ifStmt(std::move(cond), std::move(thenStmt), std::move(elseStmt));
     }
@@ -422,6 +480,17 @@ private:
         return Stmt::gotoStmt(em_.labelFor(target));
     }
 
+    // How much a statement weighs, for deciding which arm reads better first.
+    static int weigh(const ast::Stmt& s) {
+        int n = s.kind == ast::StmtKind::Compound ? 0 : 1;
+        for (const auto& c : s.body) n += c ? weigh(*c) : 0;
+        if (s.thenBranch) n += weigh(*s.thenBranch);
+        if (s.elseBranch) n += weigh(*s.elseBranch);
+        if (s.loopBody) n += weigh(*s.loopBody);
+        for (const auto& c : s.cases) n += c.body ? weigh(*c.body) : 0;
+        return n;
+    }
+
     static ExprPtr invert(ExprPtr cond) {
         if (!cond) return cond;
         if (cond->kind == ast::ExprKind::Binary) {
@@ -439,6 +508,15 @@ private:
             }
             if (ok) {
                 cond->binOp = inv;
+                return cond;
+            }
+            // De Morgan: negating a chain reads as the opposite chain, not as
+            // a bang in front of a parenthesised one.
+            if (cond->binOp == BinOp::LogicalAnd || cond->binOp == BinOp::LogicalOr) {
+                BinOp flipped = cond->binOp == BinOp::LogicalAnd ? BinOp::LogicalOr : BinOp::LogicalAnd;
+                cond->binOp = flipped;
+                cond->args[0] = invert(std::move(cond->args[0]));
+                cond->args[1] = invert(std::move(cond->args[1]));
                 return cond;
             }
         }
