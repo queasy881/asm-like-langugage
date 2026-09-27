@@ -2,6 +2,7 @@
 #include "analysis/cfg_dump.h"
 #include "analysis/program.h"
 #include "disasm/disassembler.h"
+#include "lift/lifter.h"
 #include "pe/pe_image.h"
 
 #include <cstdio>
@@ -19,6 +20,8 @@ struct Options {
     bool functions = false;
     bool cfg = false;
     bool blocks = false;
+    bool ir = false;
+    bool verify = false;
     std::string function; // address or name filter
 };
 
@@ -31,6 +34,8 @@ void usage() {
         "  --functions         discovered functions and their blocks\n"
         "  --blocks            basic blocks with instructions\n"
         "  --cfg               control-flow graphs (edges, dominators, loops)\n"
+        "  --ir                lifted IR (pre-SSA)\n"
+        "  --verify            run IR verification and report problems\n"
         "\n"
         "filters:\n"
         "  --function <addr|name>  restrict output to one function\n"
@@ -97,6 +102,8 @@ int main(int argc, char** argv) {
         else if (a == "--functions") opt.functions = true;
         else if (a == "--cfg") opt.cfg = true;
         else if (a == "--blocks") opt.blocks = true;
+        else if (a == "--ir") opt.ir = true;
+        else if (a == "--verify") opt.verify = true;
         else if (a == "--function" && i + 1 < argc) opt.function = argv[++i];
         else if (!a.empty() && a[0] == '-') { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); usage(); return 2; }
         else opt.path = a;
@@ -115,6 +122,22 @@ int main(int argc, char** argv) {
         if (!opt.function.empty() && funcs.empty()) {
             std::fprintf(stderr, "error: no function matches '%s'\n", opt.function.c_str());
             return 1;
+        }
+        if (opt.ir || opt.verify) {
+            int problems = 0;
+            for (Function* f : funcs) {
+                lift::LiftOptions lo;
+                auto r = lift::liftFunction(prog, *f, lo);
+                auto errs = r.func->verify();
+                if (opt.ir) std::printf("\n%s", r.func->print(true).c_str());
+                if (!errs.empty()) {
+                    std::printf("\nIR verification failed for %s:\n", f->name.c_str());
+                    for (const auto& e : errs) std::printf("  %s\n", e.c_str());
+                    ++problems;
+                }
+            }
+            if (opt.verify) std::printf("\n%zu functions verified, %d with problems\n", funcs.size(), problems);
+            return problems ? 1 : 0;
         }
         if (opt.cfg) {
             for (Function* f : funcs) std::printf("\n%s", dumpCfg(prog, *f).c_str());
