@@ -1,5 +1,8 @@
 #include "core/interpreter.h"
 
+#include <cstdlib>
+#include <cstring>
+
 #include "opt/passes.h"
 
 #include <algorithm>
@@ -269,6 +272,54 @@ InterpResult interpret(const ir::Function& f, InterpMemory& mem, const InterpOpt
                     out = x ? (u64)(63 - __builtin_clzll(x)) : 0;
                 } else if (n == "_parity8") {
                     out = (__builtin_popcount((unsigned)(a(0) & 0xFF)) & 1) ? 0 : 1;
+                } else if (n.rfind("rep_", 0) == 0) {
+                    // The bulk string operations. The intrinsic's operand
+                    // order follows the lifter: destination, source or value,
+                    // then the count.
+                    size_t us = n.rfind('_');
+                    unsigned esz = 4;
+                    {
+                        unsigned wbits = (unsigned)std::strtoul(n.c_str() + us + 1, nullptr, 10);
+                        // The suffix is the element width in bits, but the
+                        // mnemonic itself also ends in digits for movs32 etc.
+                        for (size_t k = 4; k < n.size(); ++k)
+                            if (n[k] >= '0' && n[k] <= '9') {
+                                wbits = (unsigned)std::strtoul(n.c_str() + k, nullptr, 10);
+                                break;
+                            }
+                        esz = wbits / 8;
+                        if (!esz) esz = 1;
+                    }
+                    std::string kind = n.substr(4, 4);
+                    out = 0;
+                    if (kind == "stos") {
+                        u64 di = a(0), val = a(1), cnt = a(2);
+                        for (u64 i = 0; i < cnt; ++i) mem.write(di + i * esz, esz, val);
+                    } else if (kind == "movs") {
+                        u64 di = a(0), si = a(1), cnt = a(2);
+                        for (u64 i = 0; i < cnt; ++i) {
+                            u64 v = 0;
+                            if (!mem.read(si + i * esz, esz, v)) {
+                                res.error = strfmt("unmapped load at %s", hex(si + i * esz).c_str());
+                                return res;
+                            }
+                            mem.write(di + i * esz, esz, v);
+                        }
+                    } else if (kind == "lods") {
+                        u64 si = a(0), cnt = a(1);
+                        if (cnt) {
+                            u64 v = 0;
+                            if (!mem.read(si + (cnt - 1) * esz, esz, v)) {
+                                res.error = "unmapped load in rep lods";
+                                return res;
+                            }
+                            out = v;
+                        }
+                    } else {
+                        // scas and cmps only matter for their flags, which the
+                        // lifter already marks unknown.
+                        out = 0;
+                    }
                 } else if (n == "_rotl_carry" || n == "_rotr_carry") {
                     out = 0;
                 } else if (n.rfind("aux_carry", 0) == 0) {

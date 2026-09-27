@@ -138,21 +138,39 @@ struct Recovery {
         return target;
     }
 
+    struct Leaf { i64 lo, hi; int target; };
+    std::vector<Leaf> leaves;
+
     void leaf(int rawTarget, i64 lo, i64 hi) {
-        int target = resolve(rawTarget);
         if (lo > hi) return;
-        // Unsigned arithmetic, because the full 64-bit domain overflows a
-        // signed subtraction; it wraps to zero here, which reads as "wide".
-        u64 span = (u64)hi - (u64)lo + 1;
-        if (span != 0 && span <= kMaxLeafValues) {
-            for (i64 v = lo; ; ++v) {
-                caseOf.emplace(v, target);
-                if (v == hi) break;
+        leaves.push_back({lo, hi, resolve(rawTarget)});
+    }
+
+    // The same block is often the arm for one value and the fallback for a
+    // whole span. Narrow claims win, so the ranges are resolved smallest
+    // first rather than in the order the walk happened to reach them.
+    void settle() {
+        // Unsigned arithmetic, because the full domain overflows a signed
+        // subtraction; it wraps to zero here, which reads as "widest".
+        auto span = [](const Leaf& l) { return (u64)l.hi - (u64)l.lo + 1; };
+        std::stable_sort(leaves.begin(), leaves.end(), [&](const Leaf& a, const Leaf& b) {
+            u64 sa = span(a), sb = span(b);
+            if (sa == 0) return false;
+            if (sb == 0) return true;
+            return sa < sb;
+        });
+        for (const Leaf& l : leaves) {
+            u64 n = span(l);
+            if (n != 0 && n <= kMaxLeafValues) {
+                for (i64 v = l.lo; ; ++v) {
+                    caseOf.emplace(v, l.target);
+                    if (v == l.hi) break;
+                }
+                continue;
             }
-            return;
+            if (defaultTarget == -1) defaultTarget = l.target;
+            else if (defaultTarget != l.target) failed = true;
         }
-        if (defaultTarget == -1) defaultTarget = target;
-        else if (defaultTarget != target) failed = true;
     }
 
     void walk(int id, i64 lo, i64 hi, int depth) {
@@ -284,6 +302,7 @@ int recoverSwitches(ir::Function& f) {
             i64 lo = bits == 64 ? INT64_MIN : -((i64)1 << (bits - 1));
             i64 hi = bits == 64 ? INT64_MAX : ((i64)1 << (bits - 1)) - 1;
             r.walk(id, lo, hi, 0);
+            r.settle();
             if (r.failed || r.defaultTarget < 0) continue;
             if (r.tree.size() < 2 || r.caseOf.size() < kMinCases) continue;
 

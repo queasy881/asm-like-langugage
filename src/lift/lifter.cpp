@@ -991,8 +991,10 @@ bool Lifter::liftLogic(const Instruction& in) {
 }
 
 bool Lifter::liftShift(const Instruction& in) {
-    auto shiftCount = [&](ValueId base) {
-        ValueId c = in.numOps >= 2 ? readOperand(in, 1) : konst(ir::kI8, 1);
+    // shld and shrd take the count as their third operand; every other shift
+    // takes it as the second.
+    auto shiftCount = [&](ValueId base, unsigned opIndex = 1) {
+        ValueId c = in.numOps > opIndex ? readOperand(in, opIndex) : konst(ir::kI8, 1);
         c = emitZExtTo(emitTruncTo(c, 1), bytesOf(base));
         return bin(Op::And, c, konstLike(base, shiftMask(bytesOf(base))));
     };
@@ -1047,11 +1049,17 @@ bool Lifter::liftShift(const Instruction& in) {
         if (in.numOps < 3) return false;
         ValueId a = readOperand(in, 0);
         ValueId b = emitTruncTo(readOperand(in, 1), bytesOf(a));
-        ValueId c = shiftCount(a);
+        ValueId c = shiftCount(a, 2);
         unsigned bits = bytesOf(a) * 8;
         ValueId inv = bin(Op::Sub, konstLike(a, bits), c);
         ValueId r = in.mnem == Mnem::Shld ? bin(Op::Or, bin(Op::Shl, a, c), bin(Op::LShr, b, inv))
                                           : bin(Op::Or, bin(Op::LShr, a, c), bin(Op::Shl, b, inv));
+        // A count of zero leaves the destination alone. Spelling that out
+        // matters: the complementary shift would otherwise be by the full
+        // width, which the hardware masks back to no shift at all.
+        const ir::Inst& ci = fn_->inst(c);
+        if (!(ci.op == Op::Const && truncBits(ci.imm, ci.type.bits) != 0))
+            r = select(cmp(Op::CmpEq, c, konstLike(c, 0)), a, r);
         writeOperand(in, 0, r);
         setFlagsShift(r, undef(ir::kI1), kNoValue);
         return true;
@@ -2210,6 +2218,37 @@ void Lifter::computeDefinedRegs() {
     }
 }
 
+// A function whose result is a double leaves it in xmm0 and never writes the
+// integer return register. Without noticing that, the return reads rax, finds
+// the value the caller passed in, and the signature comes out void.
+void Lifter::computeFloatReturn() {
+    floatReturn_ = false;
+    bool anyReturn = false;
+    for (size_t bi = 0; bi < mf_.blocks.size(); ++bi) {
+        const BasicBlock& b = mf_.blocks[bi];
+        if (b.term != Terminator::Return) continue;
+        anyReturn = true;
+        u32 gpr = bi < blockDefinedGpr_.size() ? blockDefinedGpr_[bi] : 0;
+        u32 xmm = bi < blockDefinedXmm_.size() ? blockDefinedXmm_[bi] : 0;
+        for (const auto& in : b.insns) {
+            for (size_t fi = 0; fi < (size_t)Family::Count; ++fi) {
+                Family f = (Family)fi;
+                if (!instWritesFamily(in, f)) continue;
+                if (isGprFamily(f)) gpr |= 1u << gprIndex(f);
+                else if (isXmmFamily(f)) xmm |= 1u << xmmIndex(f);
+            }
+            if (in.numOps >= 1 && in.ops[0].isReg() && isXmmFamily(regFamily(in.ops[0].reg)))
+                xmm |= 1u << xmmIndex(regFamily(in.ops[0].reg));
+        }
+        ConventionInfo ci = conventionInfo(
+            opt_.convention == CallConv::Unknown ? defaultConvention(is64_) : opt_.convention, is64_);
+        bool intSet = (gpr & (1u << gprIndex(ci.intReturn))) != 0;
+        bool fltSet = (xmm & 1u) != 0;
+        if (intSet || !fltSet) return;
+    }
+    floatReturn_ = anyReturn;
+}
+
 unsigned Lifter::guessArgumentCount(const Instruction& call, const ConventionInfo& ci,
                                     std::vector<bool>& isFloat, std::vector<unsigned>& widths) const {
     // Width the argument register was most recently written at, so a 32-bit
@@ -2389,6 +2428,8 @@ void Lifter::emitTerminator(const BasicBlock& b) {
         // function itself uses, so the synthetic read never widens the family.
         Type rt = opt_.returnTypeKnown ? opt_.returnType
                                        : intTypeForBytes(std::min<unsigned>(familyWidth(ci.intReturn), ps));
+        if (!opt_.returnTypeKnown && floatReturn_)
+            rt = familyWidth(xmmFamily(0)) == 4 ? ir::kF32 : ir::kF64;
         if (rt.isFloat()) {
             ValueId v = regs_->readFamily(xmmFamily(0), rt.bytes());
             return typeOf(v) == rt ? v : fn_->cast(cur_, Op::Bitcast, rt, emitTruncTo(v, rt.bytes()), addr_);
@@ -2535,6 +2576,7 @@ void Lifter::emitTerminator(const BasicBlock& b) {
 LiftResult Lifter::run() {
     computeStackDeltas();
     computeDefinedRegs();
+    computeFloatReturn();
     computeFlagEntryStates();
     blockMap_.assign(mf_.blocks.size(), -1);
     for (size_t i = 0; i < mf_.blocks.size(); ++i) blockMap_[i] = fn_->addBlock(mf_.blocks[i].start);

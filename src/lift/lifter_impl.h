@@ -133,6 +133,10 @@ private:
     // much they differ from the stack pointer at function entry.
     std::vector<std::map<x86::Family, i64>> blockFrameRegs_;
     std::vector<u32> blockDefinedGpr_;
+    // The function computes its result in xmm0 and never touches the integer
+    // return register, so what it returns is a floating point value.
+    bool floatReturn_ = false;
+    void computeFloatReturn();
     std::vector<u32> blockDefinedXmm_;
     ValueId callResult_ = kNoValue;
     std::array<ValueId, ir::FlagCount> flagLoc_{}; // cached ReadLoc per flag
