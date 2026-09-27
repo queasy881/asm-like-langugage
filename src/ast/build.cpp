@@ -1,4 +1,5 @@
 #include "ast/build.h"
+#include "ast/named_constants.h"
 
 #include <algorithm>
 #include <cmath>
@@ -16,37 +17,13 @@ using ir::kNoValue;
 
 namespace {
 
-// Constants worth printing by name rather than as a magic number.
-struct NamedConstant {
-    u64 value;
-    unsigned bits;
-    const char* name;
-};
-const NamedConstant kNamedConstants[] = {
-    {0x811c9dc5ull, 32, "FNV1A_OFFSET_32"},
-    {0x01000193ull, 32, "FNV1A_PRIME_32"},
-    {0xcbf29ce484222325ull, 64, "FNV1A_OFFSET_64"},
-    {0x00000100000001b3ull, 64, "FNV1A_PRIME_64"},
-    {0xdeadbeefull, 32, "DEADBEEF"},
-    {0xcafebabeull, 32, "CAFEBABE"},
-    {0xedb88320ull, 32, "CRC32_POLY_REVERSED"},
-    {0x04c11db7ull, 32, "CRC32_POLY"},
-    {0xcc9e2d51ull, 32, "MURMUR3_C1"},
-    {0x1b873593ull, 32, "MURMUR3_C2"},
-    {0x85ebca6bull, 32, "MURMUR3_FMIX1"},
-    {0xc2b2ae35ull, 32, "MURMUR3_FMIX2"},
-    {0x9e3779b9ull, 32, "GOLDEN_RATIO_32"},
-    {0x9e3779b97f4a7c15ull, 64, "GOLDEN_RATIO_64"},
-    {0x2545f4914f6cdd1dull, 64, "XORSHIFT_MULT"},
-    {0xbf58476d1ce4e5b9ull, 64, "SPLITMIX_MIX1"},
-    {0x94d049bb133111ebull, 64, "SPLITMIX_MIX2"},
-};
-
-const char* namedConstant(u64 v, unsigned bits) {
-    for (const auto& c : kNamedConstants)
-        if (c.value == v && c.bits == bits) return c.name;
-    return nullptr;
+// A frame slot's name. A negative offset is a local; a positive one is in the
+// caller's frame, which is where an argument spill area lives.
+std::string frameSlotName(i64 off) {
+    return off < 0 ? strfmt("local_%llx", (unsigned long long)(-off))
+                   : strfmt("inframe_%llx", (unsigned long long)off);
 }
+
 
 BinOp binOpFor(Op op) {
     switch (op) {
@@ -194,6 +171,13 @@ ExprPtr Builder::buildObject(ValueId addrVal, ir::Type accessType) {
     types::TypeTable& tt = *in_.typeTable;
     types::TypeRef accessC = irToC(accessType);
     const ir::Inst& a = f_.inst(addrVal);
+    // Indexing or dereferencing needs a pointer to the element; anything else
+    // has to say what it is being read as.
+    auto asPointerTo = [&](ExprPtr e, types::TypeRef elem) {
+        types::TypeRef want = tt.pointer(elem);
+        if (e->type && e->type->isPointer() && e->type->pointee == elem) return e;
+        return Expr::cast(want, std::move(e));
+    };
 
     // base + constant, where base points at a structure.
     auto tryMember = [&](ValueId base, i64 offset) -> ExprPtr {
@@ -220,7 +204,8 @@ ExprPtr Builder::buildObject(ValueId addrVal, ir::Type accessType) {
             types::TypeRef bt = types_.of(a.args[0]);
             if (bt && bt->isPointer() && bt->pointee && bt->pointee->sizeInBytes() == accessType.bytes() &&
                 accessType.bytes() && off % (i64)accessType.bytes() == 0) {
-                return Expr::index(accessC, build(a.args[0]),
+                types::TypeRef elem = bt->pointee;
+                return Expr::index(elem, asPointerTo(build(a.args[0]), elem),
                                    Expr::intConst(tt.integer(32, true), (u64)(off / (i64)accessType.bytes())));
             }
         }
@@ -234,8 +219,10 @@ ExprPtr Builder::buildObject(ValueId addrVal, ir::Type accessType) {
             return true;
         };
         ValueId idx = kNoValue;
-        if (scaledIndex(rhs, idx)) return Expr::index(accessC, build(a.args[0]), build(idx));
-        if (scaledIndex(lhs, idx)) return Expr::index(accessC, build(a.args[1]), build(idx));
+        if (scaledIndex(rhs, idx))
+            return Expr::index(accessC, asPointerTo(build(a.args[0]), accessC), build(idx));
+        if (scaledIndex(lhs, idx))
+            return Expr::index(accessC, asPointerTo(build(a.args[1]), accessC), build(idx));
         // Byte arrays need no scale, so the index is the addend itself.
         if (accessType.bytes() == 1) {
             for (int side = 0; side < 2; ++side) {
@@ -244,7 +231,8 @@ ExprPtr Builder::buildObject(ValueId addrVal, ir::Type accessType) {
                 if (bt->pointee->sizeInBytes() != 1) continue;
                 types::TypeRef ot = types_.of(a.args[1 - side]);
                 if (ot && ot->isPointer()) continue;
-                return Expr::index(bt->pointee, build(a.args[side]), build(a.args[1 - side]));
+                return Expr::index(bt->pointee, asPointerTo(build(a.args[side]), bt->pointee),
+                                   build(a.args[1 - side]));
             }
         }
     }
@@ -252,7 +240,7 @@ ExprPtr Builder::buildObject(ValueId addrVal, ir::Type accessType) {
 
     if (a.op == Op::FrameAddr) {
         // A local's address dereferenced is just the local.
-        return Expr::raw(accessC, strfmt("local_%llx", (unsigned long long)(-(i64)a.imm)));
+        return Expr::raw(accessC, frameSlotName((i64)a.imm));
     }
     if (a.op == Op::GlobalAddr) {
         return Expr::global(accessC, a.imm, globalName(a.imm));
@@ -311,9 +299,16 @@ ExprPtr Builder::buildInst(const ir::Inst& in) {
         return Expr::addrOf(t, Expr::global(tt.unknown(), in.imm, globalName(in.imm)));
     }
     case Op::FrameAddr:
-        return Expr::addrOf(t, Expr::raw(tt.unknown(), strfmt("local_%llx", (unsigned long long)(-(i64)in.imm))));
-    case Op::Load:
-        return buildObject(in.args[0], in.type);
+        return Expr::addrOf(t, Expr::raw(tt.unknown(), frameSlotName((i64)in.imm)));
+    case Op::Load: {
+        ExprPtr e = buildObject(in.args[0], in.type);
+        // What was loaded may be known to be a pointer even though the access
+        // itself only says how wide it was. Saying so here keeps the uses -
+        // indexing, field access - valid C.
+        if (t && t->isPointer() && e->type && !e->type->isPointer() && !e->type->isStruct())
+            e = Expr::cast(t, std::move(e));
+        return e;
+    }
     case Op::Select:
         return Expr::ternary(t, build(in.args[0]), build(in.args[1]), build(in.args[2]));
     case Op::Not:
@@ -343,6 +338,16 @@ ExprPtr Builder::buildInst(const ir::Inst& in) {
     }
     case Op::Intrinsic: {
         std::vector<ExprPtr> args;
+        // An instruction with no model at all is reported, not guessed at.
+        // Spelling it as a call to a named placeholder keeps what it reads
+        // visible and the surrounding code readable.
+        if (in.text.rfind("asm(", 0) == 0) {
+            std::string body = in.text.substr(5, in.text.size() >= 7 ? in.text.size() - 7 : 0);
+            args.push_back(Expr::stringLit(in_.typeTable->pointer(in_.typeTable->integer(8, true)),
+                                           body, false));
+            for (ValueId a : in.args) args.push_back(build(a));
+            return Expr::raw(t, "__unmodelled", std::move(args), true);
+        }
         for (ValueId a : in.args) args.push_back(build(a));
         // An operation the machine has and C does not is always written as a
         // call, even when it takes nothing.
@@ -408,6 +413,30 @@ ExprPtr Builder::buildInst(const ir::Inst& in) {
                 t = s;
             }
         }
+        // C only allows a pointer in an addition, a subtraction of two
+        // compatible pointers, and a comparison. Anywhere else it has to be
+        // read as the integer it is.
+        {
+            bool aPtr = a && a->type && a->type->isPointer();
+            bool bPtr = b && b->type && b->type->isPointer();
+            bool arith = in.op == Op::Add || in.op == Op::Sub;
+            types::TypeRef intT = t && t->isInteger() ? t : in_.typeTable->integer(in.type.bits ? in.type.bits : 64, true);
+            if (in.op == Op::Sub && aPtr && bPtr) {
+                // A difference of pointers is only C if they agree; make them.
+                if (a->type->pointee != b->type->pointee) {
+                    types::TypeRef bytePtr = in_.typeTable->pointer(in_.typeTable->integer(8, false));
+                    a = Expr::cast(bytePtr, std::move(a));
+                    b = Expr::cast(bytePtr, std::move(b));
+                }
+            } else if (in.op == Op::Sub && bPtr && !aPtr) {
+                b = Expr::cast(intT, std::move(b));
+                t = intT;
+            } else if (!arith && (aPtr || bPtr)) {
+                if (aPtr) a = Expr::cast(intT, std::move(a));
+                if (bPtr) b = Expr::cast(intT, std::move(b));
+                t = intT;
+            }
+        }
         // Pointer arithmetic reads better with the pointer first.
         if (in.op == Op::Add && b && a && b->type && a->type && b->type->isPointer() &&
             !a->type->isPointer()) {
@@ -440,12 +469,10 @@ ExprPtr Builder::buildInst(const ir::Inst& in) {
             b && b->type && !b->type->isPointer()) {
             types::TypeRef elem = a->type->pointee;
             unsigned esz = elem ? elem->sizeInBytes() : 1;
-            if (esz > 1) {
+            if (esz > 1 || !elem || elem->kind == types::Kind::Void) {
                 types::TypeRef bytePtr = in_.typeTable->pointer(in_.typeTable->integer(8, false));
                 a = Expr::cast(bytePtr, std::move(a));
                 t = bytePtr;
-            } else if (!elem) {
-                t = a->type;
             }
         }
         if (in.op == Op::Rol || in.op == Op::Ror) {
@@ -870,19 +897,32 @@ std::unique_ptr<Function> Builder::build() {
         if (!needsTopDeclaration_.count(var.id)) continue;
         fn->declarations.push_back(Stmt::decl(var.id, var.type, var.name, nullptr, false));
     }
-    // Locals that stayed in memory need declaring too.
-    if (in_.frame) {
+    // Locals that stayed in memory need declaring too, and so does every other
+    // frame slot the code still names.
+    {
         std::set<i64> referenced;
         for (const auto& b : f_.blocks())
             for (ValueId v : b.insts)
                 if (f_.inst(v).op == Op::FrameAddr) referenced.insert((i64)f_.inst(v).imm);
-        for (const auto& slot : in_.frame->slots) {
-            if (slot.promoted || slot.kind != SlotKind::Local) continue;
-            if (!referenced.count(slot.offset)) continue;
-            types::TypeRef t = in_.typeTable->integer(std::max(8u, slot.size * 8), true);
-            if (slot.size > 8) t = in_.typeTable->array(in_.typeTable->integer(8, false), slot.size);
+        std::set<std::string> declared;
+        for (const auto& d : fn->declarations) declared.insert(d->declName);
+        if (in_.frame) {
+            for (const auto& slot : in_.frame->slots) {
+                if (slot.promoted || slot.kind != SlotKind::Local) continue;
+                if (!referenced.count(slot.offset)) continue;
+                types::TypeRef t = in_.typeTable->integer(std::max(8u, slot.size * 8), true);
+                if (slot.size > 8) t = in_.typeTable->array(in_.typeTable->integer(8, false), slot.size);
+                std::string name = frameSlotName(slot.offset);
+                if (!declared.insert(name).second) continue;
+                fn->declarations.push_back(Stmt::decl(-1, t, name, nullptr, false));
+                referenced.erase(slot.offset);
+            }
+        }
+        for (i64 off : referenced) {
+            std::string name = frameSlotName(off);
+            if (!declared.insert(name).second) continue;
             fn->declarations.push_back(
-                Stmt::decl(-1, t, strfmt("local_%llx", (unsigned long long)(-slot.offset)), nullptr, false));
+                Stmt::decl(-1, in_.typeTable->integer(64, true), name, nullptr, false));
         }
     }
     fn->body = std::move(result.body);

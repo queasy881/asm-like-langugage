@@ -287,10 +287,16 @@ VariableMap recoverVariables(ir::Function& f, const types::TypeResult& types, co
                 map.variables[id].isParam = true;
                 map.variables[id].paramIndex = (int)in.aux;
             }
-            // Prefer the most confident type the class saw.
+            // Prefer the most confident type the class saw. A pointer to a
+            // recovered structure beats a pointer to a scalar, because the
+            // field accesses are written against it.
             types::TypeRef t = types.of(v);
-            if (t && (!map.variables[id].type || map.variables[id].type->kind == types::Kind::Unknown))
-                map.variables[id].type = t;
+            types::TypeRef& cur = map.variables[id].type;
+            auto toStruct = [](types::TypeRef x) {
+                return x && x->isPointer() && x->pointee && x->pointee->isStruct();
+            };
+            if (t && (!cur || cur->kind == types::Kind::Unknown || (toStruct(t) && !toStruct(cur))))
+                cur = t;
         }
     }
     // A phi argument that got inlined still needs its variable, because the

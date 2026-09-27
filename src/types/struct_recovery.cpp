@@ -47,8 +47,10 @@ std::vector<const Type*> recoverStructs(ir::Function& f, TypeTable& table, TypeR
 
         const ir::Inst& rootIn = f.inst(root);
         std::string name;
-        if (rootIn.op == Op::Arg) name = strfmt("s_%s_arg%u", functionName.c_str(), rootIn.aux + 1);
-        else name = strfmt("s_%s_%s", functionName.c_str(), layoutHash(accesses).c_str());
+        if (rootIn.op == Op::Arg)
+            name = sanitizeIdentifier(strfmt("s_%s_arg%u", functionName.c_str(), rootIn.aux + 1));
+        else
+            name = sanitizeIdentifier(strfmt("s_%s_%s", functionName.c_str(), layoutHash(accesses).c_str()));
 
         Type* st = table.makeStruct(name);
         if (!st->fields.empty()) {

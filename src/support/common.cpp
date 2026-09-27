@@ -71,3 +71,15 @@ std::string escapeCString(std::string_view s) {
 }
 
 } // namespace dc
+
+namespace dc {
+
+std::string sanitizeIdentifier(const std::string& name) {
+    std::string out;
+    out.reserve(name.size());
+    for (char c : name) out += (std::isalnum((unsigned char)c) || c == '_') ? c : '_';
+    if (out.empty() || std::isdigit((unsigned char)out[0])) out.insert(out.begin(), '_');
+    return out;
+}
+
+} // namespace dc

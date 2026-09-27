@@ -34,6 +34,7 @@ void TypeInference::unite(int a, int b) {
     fa.unsignedVotes += fb.unsignedVotes;
     fa.boolean = fa.boolean || fb.boolean;
     fa.pointer = fa.pointer || fb.pointer;
+    fa.notFloat = fa.notFloat || fb.notFloat;
     fa.codePointer = fa.codePointer || fb.codePointer;
     if (!fa.pointee) fa.pointee = fb.pointee;
     if (!fa.fixed) fa.fixed = fb.fixed;
@@ -125,6 +126,18 @@ void TypeInference::seed(ir::Function& f, const Signature& sig) {
                     if (a.kind == Kind::Unknown) a.kind = Kind::Int;
                 }
                 break;
+            case Op::And: case Op::Or: case Op::Xor: case Op::Not:
+            case Op::Shl: case Op::Rol: case Op::Ror:
+                // Bit manipulation is an integer operation. A value that is a
+                // float everywhere else cannot also be masked, and printing it
+                // as one produces C that does not even compile.
+                if (!in.type.isFloat()) {
+                    fc.notFloat = true;
+                    if (fc.kind == Kind::Unknown) fc.kind = Kind::Int;
+                }
+                for (ValueId a : in.args)
+                    if (!f.inst(a).type.isFloat()) facts(a).notFloat = true;
+                break;
             case Op::SExt:
                 facts(in.args[0]).signedVotes += 2;
                 break;
@@ -213,6 +226,28 @@ void TypeInference::seed(ir::Function& f, const Signature& sig) {
 }
 
 void TypeInference::propagate(ir::Function& f) {
+    // Values that take part in a relational comparison against something that
+    // is not a null test. Those behave like indices, not like objects.
+    std::map<ValueId, bool> ordered;
+    for (const auto& b : f.blocks()) {
+        for (ValueId v : b.insts) {
+            const ir::Inst& in = f.inst(v);
+            switch (in.op) {
+            case Op::CmpSlt: case Op::CmpSle: case Op::CmpSgt: case Op::CmpSge:
+            case Op::CmpUlt: case Op::CmpUle: case Op::CmpUgt: case Op::CmpUge:
+                break;
+            default:
+                continue;
+            }
+            if (in.args.size() != 2) continue;
+            for (int i = 0; i < 2; ++i) {
+                const ir::Inst& o = f.inst(in.args[1 - i]);
+                if (o.op == Op::Const && o.imm == 0) continue;   // a null test
+                ordered[in.args[i]] = true;
+            }
+        }
+    }
+
     // Phase one: work out which values are pointers, to a fixed point. This
     // has to finish before anything is united, because uniting the operands of
     // an addition would otherwise drag the offset into the pointer's class.
@@ -267,9 +302,14 @@ void TypeInference::propagate(ir::Function& f) {
                     // looks like an index leaves the other as the pointer.
                     auto indexLike = [&](ValueId o) {
                         const ir::Inst& oi = f.inst(o);
-                        if (oi.op == Op::Const) return 3;
-                        if (oi.op == Op::Mul || oi.op == Op::Shl) return 2;
-                        if (oi.op == Op::SExt || oi.op == Op::ZExt) return 2;
+                        if (oi.op == Op::Const) return 4;
+                        if (oi.op == Op::Mul || oi.op == Op::Shl) return 3;
+                        if (oi.op == Op::SExt || oi.op == Op::ZExt) return 3;
+                        // Where both sides are the same width, as on 32-bit,
+                        // the tell is that an index gets range-checked and a
+                        // pointer does not.
+                        auto it = ordered.find(o);
+                        if (it != ordered.end() && it->second) return 2;
                         if (oi.type.bits < prog_.pointerSize() * 8) return 1;
                         return 0;
                     };
@@ -458,7 +498,11 @@ void TypeInference::collectPointerAccesses(ir::Function& f, TypeResult& out) {
 TypeRef TypeInference::resolve(const ValueFacts& fc, unsigned ptrBits) {
     if (fc.fixed) return fc.fixed;
     switch (fc.kind) {
-    case Kind::Float: return table_.floating(fc.bits == 32 ? 32 : 64);
+    case Kind::Float:
+        // Bit manipulation wins over a float guess: a value that is masked
+        // and shifted is being used as the bits of one, not as one.
+        if (fc.notFloat) return table_.integer(fc.bits ? fc.bits : ptrBits, false);
+        return table_.floating(fc.bits == 32 ? 32 : 64);
     case Kind::Pointer: return table_.pointer(fc.pointee ? fc.pointee : table_.voidType());
     case Kind::Bool: return table_.boolType();
     case Kind::Int:

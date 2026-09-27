@@ -59,6 +59,10 @@ inline u64 fnv1a64(std::string_view s, u64 seed = 0xcbf29ce484222325ull) {
 std::string toLower(std::string_view s);
 bool startsWith(std::string_view s, std::string_view prefix);
 bool endsWith(std::string_view s, std::string_view suffix);
+// A symbol out of a binary may hold characters C does not allow in an
+// identifier, such as the dot in "t_switch.cold".
+std::string sanitizeIdentifier(const std::string& name);
+
 std::string escapeCString(std::string_view s);
 
 } // namespace dc

@@ -1,4 +1,6 @@
+#include <map>
 #include "cgen/cwriter.h"
+#include "ast/named_constants.h"
 
 #include <cmath>
 #include <cstdio>
@@ -13,9 +15,15 @@ using namespace dc::ast;
 
 namespace {
 
+// Globals the recovered code reaches that are declared as raw byte arrays,
+// because their real type is not known or is used inconsistently. Accesses to
+// those have to go through a cast.
+using GlobalKinds = std::map<std::string, types::TypeRef>;
+
 class Writer {
 public:
-    explicit Writer(const WriterOptions& opt) : opt_(opt) {}
+    explicit Writer(const WriterOptions& opt, const GlobalKinds* globals = nullptr)
+        : opt_(opt), globals_(globals) {}
 
     std::string function(const Function& fn);
     std::string signatureOf(const Function& fn);
@@ -29,6 +37,13 @@ private:
     void stmt(const Stmt& s);
     void stmtAsBlock(const Stmt* s);
     std::string expr(const Expr& e, int parentPrec = 0);
+    // The declared type of a global, or null when it is a raw byte array.
+    types::TypeRef globalType(const std::string& name) const {
+        if (!globals_) return nullptr;
+        auto it = globals_->find(name);
+        return it == globals_->end() ? nullptr : it->second;
+    }
+    const GlobalKinds* globals_ = nullptr;
     std::string constant(const Expr& e);
     std::string declaration(types::TypeRef t, const std::string& name);
 
@@ -49,16 +64,6 @@ void Writer::openBrace() {
 void Writer::closeBrace(const char* suffix) {
     --indent_;
     line(std::string("}") + suffix);
-}
-
-// A symbol out of a binary may hold characters C does not allow in an
-// identifier, such as the dot in "t_switch.cold".
-std::string sanitizeIdentifier(const std::string& name) {
-    std::string out;
-    out.reserve(name.size());
-    for (char c : name) out += (std::isalnum((unsigned char)c) || c == '_') ? c : '_';
-    if (out.empty() || std::isdigit((unsigned char)out[0])) out.insert(out.begin(), '_');
-    return out;
 }
 
 std::string Writer::applyPrefix(const std::string& name) const {
@@ -166,8 +171,17 @@ std::string Writer::expr(const Expr& e, int parentPrec) {
     case ExprKind::StringLit:
         return (e.wide ? "L\"" : "\"") + escapeCString(e.text) + "\"";
     case ExprKind::VarRef:
-    case ExprKind::GlobalRef:
         return e.text;
+    case ExprKind::GlobalRef: {
+        std::string name = sanitizeIdentifier(e.text);
+        types::TypeRef declared = globalType(name);
+        // A byte-array global has to be read at the width the code used.
+        if (!declared && e.type && e.type->kind != types::Kind::Unknown) {
+            std::string s2 = "*(" + e.type->spell() + "*)" + name;
+            return unaryPrecedence() < parentPrec ? "(" + s2 + ")" : s2;
+        }
+        return name;
+    }
     case ExprKind::FuncRef:
         return applyPrefix(e.text);
     case ExprKind::Raw: {
@@ -190,6 +204,10 @@ std::string Writer::expr(const Expr& e, int parentPrec) {
         return unaryPrecedence() < parentPrec ? "(" + s + ")" : s;
     }
     case ExprKind::AddrOf: {
+        // The address of a byte-array global is the array itself.
+        if (e.args[0]->kind == ExprKind::GlobalRef &&
+            !globalType(sanitizeIdentifier(e.args[0]->text)))
+            return sanitizeIdentifier(e.args[0]->text);
         std::string s = "&" + expr(*e.args[0], unaryPrecedence());
         return unaryPrecedence() < parentPrec ? "(" + s + ")" : s;
     }
@@ -203,7 +221,30 @@ std::string Writer::expr(const Expr& e, int parentPrec) {
     case ExprKind::Index:
         return expr(*e.args[0], 15) + "[" + expr(*stripIndexCast(*e.args[1]), 0) + "]";
     case ExprKind::Call: {
-        std::string s = expr(*e.args[0], 15) + "(";
+        const Expr& callee = *e.args[0];
+        std::string target;
+        // Calling through anything that is not already a function pointer
+        // needs the signature spelled out, or the C says nothing about how
+        // the call is made.
+        bool typed = callee.kind == ExprKind::FuncRef ||
+                     (callee.type && callee.type->kind == types::Kind::Function) ||
+                     (callee.type && callee.type->isPointer() && callee.type->pointee &&
+                      callee.type->pointee->kind == types::Kind::Function);
+        if (typed) {
+            target = expr(callee, 15);
+        } else {
+            std::string sig = (e.type && e.type->kind != types::Kind::Unknown ? e.type->spell()
+                                                                             : std::string("void"));
+            sig += " (*)(";
+            for (size_t i = 1; i < e.args.size(); ++i) {
+                if (i > 1) sig += ", ";
+                sig += e.args[i] && e.args[i]->type ? e.args[i]->type->spell() : std::string("LONGLONG");
+            }
+            if (e.args.size() == 1) sig += "void";
+            sig += ")";
+            target = "((" + sig + ")" + expr(callee, unaryPrecedence()) + ")";
+        }
+        std::string s = target + "(";
         for (size_t i = 1; i < e.args.size(); ++i) {
             if (i > 1) s += ", ";
             s += expr(*e.args[i], 0);
@@ -479,9 +520,20 @@ std::string writeProgram(const std::vector<const Function*>& functions,
     os << writeStructs(structs);
     // Globals the recovered code refers to but that live outside it.
     std::set<std::string> globals;
+    std::map<std::string, std::set<std::string>> globalSpellings;
+    std::map<std::string, types::TypeRef> globalOneType;
     std::function<void(const ast::Expr*)> scanExpr = [&](const ast::Expr* e) {
         if (!e) return;
-        if (e->kind == ast::ExprKind::GlobalRef && !e->text.empty()) globals.insert(sanitizeIdentifier(e->text));
+        if (e->kind == ast::ExprKind::GlobalRef && !e->text.empty()) {
+            std::string n = sanitizeIdentifier(e->text);
+            globals.insert(n);
+            if (e->type && e->type->kind != types::Kind::Unknown && !e->type->isStruct()) {
+                globalSpellings[n].insert(e->type->spell());
+                globalOneType[n] = e->type;
+            } else {
+                globalSpellings[n].insert("");   // an address-of, or an unknown width
+            }
+        }
         for (const auto& a : e->args) scanExpr(a.get());
     };
     std::function<void(const ast::Stmt&)> scanStmt = [&](const ast::Stmt& st) {
@@ -504,16 +556,32 @@ std::string writeProgram(const std::vector<const Function*>& functions,
     }
     std::set<std::string> defined;
     for (const Function* fn : functions) defined.insert(sanitizeIdentifier(fn->name));
+    GlobalKinds globalKinds;
+    for (const auto& g : globals) {
+        auto it = globalSpellings.find(g);
+        if (it != globalSpellings.end() && it->second.size() == 1 && !it->second.begin()->empty())
+            globalKinds[g] = globalOneType[g];
+    }
     if (!globals.empty()) {
         os << "/* Data outside the recovered code. */\n";
-        for (const auto& g : globals)
-            if (!defined.count(g)) os << "extern BYTE " << g << "[];\n";
+        for (const auto& g : globals) {
+            if (defined.count(g)) continue;
+            auto it = globalKinds.find(g);
+            if (it != globalKinds.end()) os << "extern " << it->second->spell(g) << ";\n";
+            else os << "extern BYTE " << g << "[];\n";
+        }
         os << "\n";
     }
     os << "/* Forward declarations, so the order of definitions does not matter. */\n";
-    for (const Function* fn : functions) os << writeDeclaration(*fn, opt) << "\n";
+    for (const Function* fn : functions) {
+        Writer w(opt, &globalKinds);
+        os << w.signatureOf(*fn) << ";\n";
+    }
     os << "\n";
-    for (const Function* fn : functions) os << writeFunction(*fn, opt) << "\n";
+    for (const Function* fn : functions) {
+        Writer w(opt, &globalKinds);
+        os << w.function(*fn) << "\n";
+    }
     return os.str();
 }
 
@@ -535,7 +603,12 @@ std::string writeStructs(const std::vector<const types::Type*>& structs) {
 }
 
 std::string writePreamble() {
-    return R"(/* Recovered by decomp. Types use the Windows spellings. */
+    std::ostringstream defs;
+    defs << "\n/* Constants the recovered code uses by name. */\n";
+    for (const auto& c : ast::kNamedConstants)
+        defs << strfmt("#define %s 0x%llx%s\n", c.name, (unsigned long long)c.value,
+                       c.bits > 32 ? "ULL" : "u");
+    return std::string(R"(/* Recovered by decomp. Types use the Windows spellings. */
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
@@ -575,7 +648,10 @@ static inline DWORD _lzcnt_u32(DWORD v) { return v ? (DWORD)__builtin_clz(v) : 3
 static inline DWORD _bit_scan_reverse(DWORD v) { return v ? (DWORD)(31 - __builtin_clz(v)) : 0u; }
 static inline bool _parity8(DWORD v) { return (__builtin_popcount(v & 0xFF) & 1) == 0; }
 
-)";
+/* An instruction with no model. The recovered code names it rather than
+   pretending to know what it does. */
+extern LONGLONG __unmodelled(const char* mnemonic, ...);
+)") + defs.str();
 }
 
 } // namespace dc::cgen

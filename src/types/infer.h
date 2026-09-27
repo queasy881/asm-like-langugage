@@ -25,6 +25,9 @@ struct ValueFacts {
     int unsignedVotes = 0;
     bool boolean = false;
     bool pointer = false;
+    // The value is bit-manipulated, so whatever else it looks like, it is not
+    // a floating point value: C has no bitwise operators on those.
+    bool notFloat = false;
     bool codePointer = false;
     TypeRef pointee = nullptr;      // when the target type is known
     TypeRef fixed = nullptr;        // an exact type from an API signature
