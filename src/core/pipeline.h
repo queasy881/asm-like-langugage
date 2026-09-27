@@ -48,6 +48,11 @@ public:
     // ... and then the optimisation passes.
     std::unique_ptr<FunctionResult> runToOptimized(const Function& f);
 
+    // Turns the entry values that match parameter locations into Arg nodes and
+    // fills in ir::Function::params, so nothing downstream sees a register or
+    // a stack slot where a parameter belongs.
+    static void bindParameters(FunctionResult& r, unsigned ptrBytes, bool is64);
+
 private:
     Program& prog_;
     PipelineOptions opt_;

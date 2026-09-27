@@ -42,7 +42,11 @@ struct CallSite {
 struct JumpTable {
     u64 jumpAddress = 0;     // the indirect jmp
     u64 loadAddress = 0;     // instruction that reads the table
-    x86::Family indexFamily = x86::Family::None; // index register at loadAddress
+    x86::Family indexFamily = x86::Family::None; // register holding the case index
+    // Address of the instruction that leaves the index in indexFamily. The
+    // index must be read right after it, because later instructions reuse the
+    // register for the table base. Zero means "at the start of the block".
+    u64 indexAddress = 0;
     u64 tableAddress = 0;
     unsigned entrySize = 4;
     bool relative = false;   // entries are offsets added to relativeBase

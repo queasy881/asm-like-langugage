@@ -154,13 +154,18 @@ TEST(lift_stack_slots_become_frame_references) {
                               0x8B, 0x44, 0x24, 0x08, 0x48, 0x83, 0xC4, 0x18, 0xC3});
     REQUIRE(L.f);
     CHECK(L.f->verify().empty());
-    int frames = countOp(*L.f, Op::FrameAddr);
-    CHECK(frames >= 2);
-    // Both references resolve to the same frame offset.
+    CHECK(countOp(*L.f, Op::FrameAddr) >= 2);
+    // Both accesses resolve to the same frame offset. Only the addresses that
+    // are actually loaded from or stored to are relevant; reading the stack
+    // pointer itself also yields a frame address.
     std::vector<i64> offs;
     for (const auto& b : L.f->blocks())
-        for (ValueId v : b.insts)
-            if (L.f->inst(v).op == Op::FrameAddr) offs.push_back((i64)L.f->inst(v).imm);
+        for (ValueId v : b.insts) {
+            const Inst& in = L.f->inst(v);
+            if (in.op != Op::Load && in.op != Op::Store) continue;
+            const Inst& a = L.f->inst(in.args[0]);
+            if (a.op == Op::FrameAddr) offs.push_back((i64)a.imm);
+        }
     REQUIRE(offs.size() >= 2);
     CHECK_EQ(offs[0], offs[1]);
     CHECK_EQ(offs[0], (i64)-0x10); // rsp-0x18+8 relative to entry

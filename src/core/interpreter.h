@@ -35,6 +35,9 @@ struct InterpOptions {
     std::function<bool(const ir::CallInfo&, const std::vector<u64>&, u64&)> onCall;
     // Initial value for a location read on entry (registers, flags).
     std::function<bool(ir::Loc, u64&)> entryValue;
+    // Value of parameter `index`. Used for Arg nodes, which the pipeline
+    // creates in place of the entry values that are really parameters.
+    std::function<bool(unsigned index, ir::Type, u64&)> argValue;
 };
 
 struct InterpResult {

@@ -161,6 +161,11 @@ ValueId RegFile::read(Reg reg) {
 
 ValueId RegFile::readFamily(Family fam, unsigned bytes, unsigned offset) {
     FamilyState& st = state(fam);
+    // A register tracked as holding a frame address is read as that address.
+    // Its architectural value was never materialised, so reading the location
+    // would hand back a stale one.
+    if (st.spRelative && offset == 0 && bytes == lifter_.pointerBytes())
+        return lifter_.emitFrameAddress(st.spDelta, bytes);
     if (st.narrowSize == bytes && st.narrowOffset == offset && st.narrow != kNoValue) return st.narrow;
     unsigned full = familyBytes(fam);
     ValueId v = materializeFull(fam);

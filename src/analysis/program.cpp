@@ -209,6 +209,7 @@ struct LinExpr {
     std::map<Family, i64> loadRegs; // load address registers
     i64 loadC = 0;
     bool valid = true;
+    bool signExtend = false;  // the definition sign-extends its source
 };
 
 // Definition of a register written by `in`, as a linear expression over the
@@ -216,7 +217,12 @@ struct LinExpr {
 bool defineReg(const Instruction& in, Family fam, LinExpr& def, bool& isLoad, u64 imageBase) {
     isLoad = false;
     def = LinExpr{};
-    if (in.numOps < 1 || !in.ops[0].isReg() || regFamily(in.ops[0].reg) != fam) return false;
+    switch (in.mnem) {
+    case Mnem::Cdqe: case Mnem::Cwde: case Mnem::Cbw:
+        break; // implicit destination
+    default:
+        if (in.numOps < 1 || !in.ops[0].isReg() || regFamily(in.ops[0].reg) != fam) return false;
+    }
     auto memToLin = [&](const Operand& op, std::map<Family, i64>& regs, i64& c) -> bool {
         const MemOperand& m = op.mem;
         c = m.disp;
@@ -249,6 +255,33 @@ bool defineReg(const Instruction& in, Family fam, LinExpr& def, bool& isLoad, u6
             return memToLin(in.ops[1], def.loadRegs, def.loadC);
         }
         return false;
+    case Mnem::Shl:
+        // A shift by a small constant is how a compiler scales an index.
+        if (in.numOps == 2 && in.ops[1].isImm() && in.ops[1].imm >= 0 && in.ops[1].imm <= 4) {
+            def.regs[fam] = (i64)1 << in.ops[1].imm;
+            return true;
+        }
+        return false;
+    case Mnem::Imul:
+        if (in.numOps == 3 && in.ops[1].isReg() && in.ops[2].isImm()) {
+            def.regs[regFamily(in.ops[1].reg)] = in.ops[2].imm;
+            return true;
+        }
+        if (in.numOps == 2 && in.ops[1].isImm()) {
+            def.regs[fam] = in.ops[1].imm;
+            return true;
+        }
+        return false;
+    case Mnem::Cdqe:
+    case Mnem::Cwde:
+    case Mnem::Cbw:
+        // Sign-extends the accumulator in place; the value is unchanged for
+        // the purpose of following the table index, but records that table
+        // entries are signed.
+        if (fam != Family::F_RAX) return false;
+        def.regs[Family::F_RAX] = 1;
+        def.signExtend = true;
+        return true;
     case Mnem::Lea:
         if (in.numOps != 2 || !in.ops[1].isMem()) return false;
         return memToLin(in.ops[1], def.regs, def.c);
@@ -322,6 +355,7 @@ bool Program::resolveJumpTable(const std::map<u64, const Instruction*>& insns, c
     }
 
     std::set<Family> frozen; // index register(s) we stop substituting
+    bool sawSignExtend = false;
     auto substitute = [&](std::map<Family, i64>& regs, i64& c, Family fam, const LinExpr& def) -> bool {
         auto it = regs.find(fam);
         if (it == regs.end()) return true;
@@ -353,6 +387,10 @@ bool Program::resolveJumpTable(const std::map<u64, const Instruction*>& insns, c
             bool isLoad = false;
             bool ok = defineReg(*cur, fam, def, isLoad, img.imageBase());
             bool inTop = e.regs.count(fam) > 0;
+            if (ok && def.signExtend && !isLoad) {
+                sawSignExtend = true;
+                continue; // the value itself is unchanged
+            }
             if (ok && isLoad && inTop && !e.hasLoad && e.regs[fam] == 1) {
                 // The table load itself.
                 e.regs.erase(fam);
@@ -362,22 +400,40 @@ bool Program::resolveJumpTable(const std::map<u64, const Instruction*>& insns, c
                 e.loadRegs = def.loadRegs;
                 e.loadC = def.loadC;
                 out.loadAddress = cur->address;
-                // The register with the largest scale is the index.
+                if (sawSignExtend) e.loadSigned = true;
+                // The scaled register is the index, but only when the scale
+                // already distinguishes it. Otherwise keep substituting: the
+                // table base is usually still an unresolved register here, and
+                // freezing now would pick it instead of the index.
                 Family idx = Family::None;
                 i64 bestScale = 0;
-                for (auto& [r, k] : e.loadRegs)
-                    if (k > bestScale) { bestScale = k; idx = r; }
-                if (idx != Family::None) frozen.insert(idx);
+                int bestCount = 0;
+                for (auto& [r, k] : e.loadRegs) {
+                    if (k > bestScale) { bestScale = k; idx = r; bestCount = 1; }
+                    else if (k == bestScale) ++bestCount;
+                }
+                if (idx != Family::None && bestScale > 1 && bestCount == 1) {
+                    frozen.insert(idx);
+                    out.indexAddress = cur->address;
+                }
                 continue;
             }
             if (!ok) {
-                if (e.loadRegs.count(fam) && !inTop && frozen.empty()) { frozen.insert(fam); continue; }
+                if (e.loadRegs.count(fam) && !inTop && frozen.empty()) {
+                    frozen.insert(fam);
+                    out.indexAddress = cur->address;
+                    continue;
+                }
                 return false;
             }
             if (inTop && !substitute(e.regs, e.c, fam, def)) return false;
             if (!inTop && e.loadRegs.count(fam)) {
                 if (def.hasLoad) {
-                    if (frozen.empty()) { frozen.insert(fam); continue; }
+                    if (frozen.empty()) {
+                        frozen.insert(fam);
+                        out.indexAddress = cur->address;
+                        continue;
+                    }
                     return false;
                 }
                 if (!substitute(e.loadRegs, e.loadC, fam, def)) return false;

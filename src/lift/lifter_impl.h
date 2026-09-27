@@ -4,6 +4,8 @@
 #include "lift/lifter.h"
 #include "lift/machine_state.h"
 
+#include <map>
+
 namespace dc::lift {
 
 class Lifter {
@@ -25,6 +27,7 @@ public:
     ValueId emitSExtTo(ValueId v, unsigned bytes);
     ValueId emitDeposit(ValueId base, ValueId narrow, unsigned offset, unsigned size, unsigned fullBytes);
     ValueId emitShiftRightConst(ValueId v, unsigned bits);
+    ValueId emitFrameAddress(i64 offset, unsigned bytes);
     ValueId toIntBits(ValueId v);
 
 private:
@@ -119,6 +122,9 @@ private:
     int fpuTop_ = 0;
     std::vector<i64> blockEntrySp_;
     std::vector<char> blockSpKnown_;
+    // Registers holding a frame address on entry to each block, and by how
+    // much they differ from the stack pointer at function entry.
+    std::vector<std::map<x86::Family, i64>> blockFrameRegs_;
     ValueId callResult_ = kNoValue;
     std::array<ValueId, ir::FlagCount> flagLoc_{}; // cached ReadLoc per flag
     // Machine block -> the instruction whose flags reach its entry, or null.

@@ -128,10 +128,7 @@ InterpResult interpret(const ir::Function& f, InterpMemory& mem, const InterpOpt
                 break;
             case Op::Arg:
                 out = 0;
-                if (opt.entryValue) {
-                    ir::Loc l{ir::LocKind::Reg, (u16)in.aux, (u16)in.type.bytes()};
-                    opt.entryValue(l, out);
-                }
+                if (opt.argValue) opt.argValue(in.aux, in.type, out);
                 break;
             case Op::EntryValue:
                 out = 0;

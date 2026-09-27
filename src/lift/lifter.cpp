@@ -238,6 +238,15 @@ ValueId Lifter::emitSExtTo(ValueId v, unsigned bytes) {
     return fn_->cast(cur_, Op::SExt, Type::i((u16)want), v, addr_);
 }
 
+ValueId Lifter::emitFrameAddress(i64 offset, unsigned bytes) {
+    ir::Inst fa;
+    fa.op = Op::FrameAddr;
+    fa.type = Type::ptr((u16)(bytes * 8));
+    fa.imm = (u64)offset;
+    fa.addr = addr_;
+    return fn_->add(cur_, std::move(fa));
+}
+
 ValueId Lifter::emitShiftRightConst(ValueId v, unsigned bits) {
     v = toIntBits(v);
     if (bits == 0) return v;
@@ -1358,6 +1367,36 @@ bool Lifter::liftSse(const Instruction& in) {
         writeOperand(in, 0, v);
         return true;
     }
+    case Mnem::Punpckldq: {
+        // Interleaves the low dwords: result = dst.d0 | (src.d0 << 32).
+        ValueId a = emitTruncTo(readOperand(in, 0), 4);
+        ValueId b2 = emitTruncTo(readOperand(in, 1), 4);
+        ValueId lo = emitZExtTo(a, 8);
+        ValueId hi = bin(Op::Shl, emitZExtTo(b2, 8), konst(ir::kI64, 32));
+        regs_->writeFamily(regFamily(in.ops[0].reg), 8, 0, bin(Op::Or, lo, hi));
+        return true;
+    }
+    case Mnem::Punpcklqdq: case Mnem::Unpcklpd: {
+        // The low half is unchanged; only the upper half takes the source.
+        return true;
+    }
+    case Mnem::Pshufd: {
+        if (in.numOps != 3 || !in.ops[2].isImm() || !in.ops[0].isReg()) return false;
+        unsigned sel = (unsigned)in.ops[2].imm;
+        unsigned s0 = sel & 3, s1 = (sel >> 2) & 3;
+        // Only selectors that stay inside the low 64 bits can be modelled
+        // without a full 128-bit value.
+        if (s0 > 1 || s1 > 1) return false;
+        ValueId src = emitZExtTo(readOperand(in, 1), 8);
+        auto dword = [&](unsigned i) {
+            ValueId v = i ? bin(Op::LShr, src, konst(ir::kI64, 32)) : src;
+            return bin(Op::And, v, konst(ir::kI64, 0xFFFFFFFFull));
+        };
+        ValueId lo = dword(s0);
+        ValueId hi = bin(Op::Shl, dword(s1), konst(ir::kI64, 32));
+        regs_->writeFamily(regFamily(in.ops[0].reg), 8, 0, bin(Op::Or, lo, hi));
+        return true;
+    }
     default:
         return false;
     }
@@ -1747,7 +1786,10 @@ void Lifter::liftCall(const Instruction& in, const CallSite* cs) {
             v = emitTruncTo(regs_->readFamily(ci.intArgRegs[pos], ps), std::min<unsigned>(pt.bytes(), ps));
             ++intIdx;
         } else {
-            i64 off = ci.stackArgStart + (i64)stackIdx * ps + spDelta_;
+            // At the call the return address has not been pushed yet, so the
+            // callee's first stack slot sits one pointer below where it will
+            // appear in the callee's own frame.
+            i64 off = spDelta_ + (ci.stackArgStart - (i64)ps) + (i64)stackIdx * ps;
             ++stackIdx;
             ValueId a = spKnown_ ? stackAddr(off) : bin(Op::Add, regs_->readFamily(Family::F_RSP, ps), konst(intTypeForBytes(ps), (u64)(off - spDelta_)));
             v = fn_->load(cur_, pt, a, addr_);
@@ -1818,91 +1860,6 @@ void Lifter::liftInstruction(const Instruction& in) {
 // Block plumbing
 // ---------------------------------------------------------------------------
 
-// Propagates the stack pointer offset (relative to function entry) through the
-// machine CFG so that [rsp+N] and [rbp-N] references resolve to frame slots.
-void Lifter::computeStackDeltas() {
-    size_t n = mf_.blocks.size();
-    blockEntrySp_.assign(n, 0);
-    blockSpKnown_.assign(n, 0);
-    unsigned ps = pointerBytes();
-    std::vector<char> visited(n, 0);
-    std::vector<int> work{0};
-    blockSpKnown_[0] = 1;
-    while (!work.empty()) {
-        int b = work.back();
-        work.pop_back();
-        if (visited[b]) continue;
-        visited[b] = 1;
-        i64 sp = blockEntrySp_[b];
-        bool known = blockSpKnown_[b] != 0;
-        i64 bp = 0;
-        bool bpValid = false;
-        for (const auto& in : mf_.blocks[b].insns) {
-            switch (in.mnem) {
-            case Mnem::Push: sp -= ps; break;
-            case Mnem::Pop: sp += ps; break;
-            case Mnem::Pushfd: case Mnem::Pushfq: sp -= ps; break;
-            case Mnem::Popfd: case Mnem::Popfq: sp += ps; break;
-            case Mnem::Sub:
-                if (in.numOps == 2 && in.ops[0].isReg(is64_ ? Reg::RSP : Reg::ESP) && in.ops[1].isImm()) sp -= in.ops[1].imm;
-                else if (in.numOps == 2 && in.ops[0].isReg(is64_ ? Reg::RSP : Reg::ESP)) known = false;
-                break;
-            case Mnem::Add:
-                if (in.numOps == 2 && in.ops[0].isReg(is64_ ? Reg::RSP : Reg::ESP) && in.ops[1].isImm()) sp += in.ops[1].imm;
-                else if (in.numOps == 2 && in.ops[0].isReg(is64_ ? Reg::RSP : Reg::ESP)) known = false;
-                break;
-            case Mnem::And:
-                if (in.numOps == 2 && in.ops[0].isReg(is64_ ? Reg::RSP : Reg::ESP)) known = false; // stack realignment
-                break;
-            case Mnem::Mov:
-                if (in.numOps == 2 && in.ops[0].isReg(is64_ ? Reg::RBP : Reg::EBP) && in.ops[1].isReg(is64_ ? Reg::RSP : Reg::ESP)) {
-                    bp = sp;
-                    bpValid = true;
-                } else if (in.numOps == 2 && in.ops[0].isReg(is64_ ? Reg::RSP : Reg::ESP)) {
-                    if (in.ops[1].isReg(is64_ ? Reg::RBP : Reg::EBP) && bpValid) sp = bp;
-                    else known = false;
-                }
-                break;
-            case Mnem::Lea:
-                if (in.numOps == 2 && in.ops[0].isReg(is64_ ? Reg::RBP : Reg::EBP) && in.ops[1].isMem() &&
-                    in.ops[1].mem.base == (is64_ ? Reg::RSP : Reg::ESP) && in.ops[1].mem.index == Reg::None) {
-                    bp = sp + in.ops[1].mem.disp;
-                    bpValid = true;
-                } else if (in.numOps == 2 && in.ops[0].isReg(is64_ ? Reg::RSP : Reg::ESP) && in.ops[1].isMem()) {
-                    if (in.ops[1].mem.base == (is64_ ? Reg::RBP : Reg::EBP) && bpValid && in.ops[1].mem.index == Reg::None)
-                        sp = bp + in.ops[1].mem.disp;
-                    else known = false;
-                }
-                break;
-            case Mnem::Leave:
-                if (bpValid) sp = bp + ps;
-                else known = false;
-                break;
-            case Mnem::Call:
-            case Mnem::Enter:
-                break;
-            default:
-                break;
-            }
-        }
-        for (const auto& e : mf_.blocks[b].succs) {
-            if (e.target < 0) continue;
-            if (!visited[e.target]) {
-                blockEntrySp_[e.target] = sp;
-                blockSpKnown_[e.target] = known ? 1 : 0;
-                work.push_back(e.target);
-            } else if (blockEntrySp_[e.target] != sp || (blockSpKnown_[e.target] != 0) != known) {
-                // Paths disagree: stop trusting the frame for that block.
-                if (blockSpKnown_[e.target]) {
-                    blockSpKnown_[e.target] = 0;
-                    visited[e.target] = 0;
-                    work.push_back(e.target);
-                }
-            }
-        }
-    }
-}
-
 namespace {
 
 // Conservative test for whether an instruction writes a register family.
@@ -1925,8 +1882,10 @@ bool instWritesFamily(const Instruction& in, Family fam) {
         return in.numOps == 1 && (fam == Family::F_RAX || fam == Family::F_RDX);
     case Mnem::Cdqe: case Mnem::Cwde: case Mnem::Cbw:
         return fam == Family::F_RAX;
-    case Mnem::Push: case Mnem::Pop: case Mnem::Leave: case Mnem::Enter:
-        return fam == Family::F_RSP || (in.mnem == Mnem::Leave && fam == Family::F_RBP);
+    case Mnem::Push: case Mnem::Pop: case Mnem::Enter:
+        return fam == Family::F_RSP;
+    case Mnem::Leave:
+        return fam == Family::F_RSP || fam == Family::F_RBP;
     case Mnem::Movsb: case Mnem::Movsw: case Mnem::MovsdStr: case Mnem::Movsq:
     case Mnem::Stosb: case Mnem::Stosw: case Mnem::Stosd: case Mnem::Stosq:
     case Mnem::Lodsb: case Mnem::Lodsw: case Mnem::Lodsd: case Mnem::Lodsq:
@@ -1973,6 +1932,203 @@ bool clobbersOperandsOf(const Instruction& def, const Instruction& in) {
 
 } // namespace
 
+// Propagates the stack pointer, and every register holding a frame address,
+// through the machine CFG. Without this a function using rbp as a frame
+// pointer would only resolve [rbp-N] inside the block that set rbp up.
+void Lifter::computeStackDeltas() {
+    size_t n = mf_.blocks.size();
+    blockEntrySp_.assign(n, 0);
+    blockSpKnown_.assign(n, 0);
+    blockFrameRegs_.assign(n, {});
+    unsigned ps = pointerBytes();
+    Reg spReg = is64_ ? Reg::RSP : Reg::ESP;
+
+    struct State {
+        bool spKnown = false;
+        i64 sp = 0;
+        std::map<Family, i64> frameRegs;
+        bool operator==(const State& o) const {
+            return spKnown == o.spKnown && sp == o.sp && frameRegs == o.frameRegs;
+        }
+    };
+    std::vector<State> entry(n), exitState(n);
+    std::vector<char> hasEntry(n, 0), hasExit(n, 0);
+    entry[0].spKnown = true;
+    entry[0].sp = 0;
+    hasEntry[0] = 1;
+
+    auto transfer = [&](size_t bi, State st) {
+        for (const auto& in : mf_.blocks[bi].insns) {
+            auto frameOf = [&](Reg r, i64& out) {
+                if (r == Reg::None) return false;
+                if (regSize(r) != ps) return false;
+                Family f = regFamily(r);
+                if (f == Family::F_RSP) {
+                    if (!st.spKnown) return false;
+                    out = st.sp;
+                    return true;
+                }
+                auto it = st.frameRegs.find(f);
+                if (it == st.frameRegs.end()) return false;
+                out = it->second;
+                return true;
+            };
+            auto setFrame = [&](Reg r, i64 v) {
+                Family f = regFamily(r);
+                if (f == Family::F_RSP) { st.sp = v; st.spKnown = true; }
+                else st.frameRegs[f] = v;
+            };
+            auto clearFrame = [&](Family f) {
+                if (f == Family::F_RSP) st.spKnown = false;
+                else st.frameRegs.erase(f);
+            };
+            switch (in.mnem) {
+            case Mnem::Push: st.sp -= ps; continue;
+            case Mnem::Pushfd: case Mnem::Pushfq: st.sp -= ps; continue;
+            case Mnem::Pop:
+                st.sp += ps;
+                if (in.numOps && in.ops[0].isReg()) clearFrame(regFamily(in.ops[0].reg));
+                continue;
+            case Mnem::Popfd: case Mnem::Popfq: st.sp += ps; continue;
+            case Mnem::Leave: {
+                i64 v;
+                if (frameOf(is64_ ? Reg::RBP : Reg::EBP, v)) { st.sp = v + ps; st.spKnown = true; }
+                else st.spKnown = false;
+                st.frameRegs.erase(Family::F_RBP);
+                continue;
+            }
+            case Mnem::Enter:
+                st.frameRegs[Family::F_RBP] = st.sp - (i64)ps;
+                st.sp -= (i64)ps + (in.numOps && in.ops[0].isImm() ? in.ops[0].imm : 0);
+                continue;
+            case Mnem::Add:
+            case Mnem::Sub: {
+                if (in.numOps != 2 || !in.ops[0].isReg()) break;
+                i64 sign = in.mnem == Mnem::Add ? 1 : -1;
+                i64 cur;
+                if (in.ops[1].isImm() && frameOf(in.ops[0].reg, cur)) {
+                    setFrame(in.ops[0].reg, cur + sign * in.ops[1].imm);
+                    continue;
+                }
+                clearFrame(regFamily(in.ops[0].reg));
+                continue;
+            }
+            case Mnem::Mov: {
+                if (in.numOps != 2 || !in.ops[0].isReg()) break;
+                i64 v;
+                if (in.ops[1].isReg() && frameOf(in.ops[1].reg, v) && regSize(in.ops[0].reg) == ps) {
+                    setFrame(in.ops[0].reg, v);
+                    continue;
+                }
+                clearFrame(regFamily(in.ops[0].reg));
+                continue;
+            }
+            case Mnem::Lea: {
+                if (in.numOps != 2 || !in.ops[0].isReg() || !in.ops[1].isMem()) break;
+                const MemOperand& m = in.ops[1].mem;
+                i64 v;
+                if (m.index == Reg::None && m.base != Reg::None && frameOf(m.base, v) &&
+                    regSize(in.ops[0].reg) == ps) {
+                    setFrame(in.ops[0].reg, v + m.disp);
+                    continue;
+                }
+                clearFrame(regFamily(in.ops[0].reg));
+                continue;
+            }
+            case Mnem::And:
+                // Stack realignment makes the offset unknowable.
+                if (in.numOps == 2 && in.ops[0].isReg(spReg)) st.spKnown = false;
+                else if (in.numOps >= 1 && in.ops[0].isReg()) clearFrame(regFamily(in.ops[0].reg));
+                continue;
+            case Mnem::Xchg:
+                if (in.numOps == 2) {
+                    if (in.ops[0].isReg()) clearFrame(regFamily(in.ops[0].reg));
+                    if (in.ops[1].isReg()) clearFrame(regFamily(in.ops[1].reg));
+                }
+                continue;
+            default:
+                break;
+            }
+            if (in.isCall()) {
+                // Volatile registers do not survive a call.
+                for (auto it = st.frameRegs.begin(); it != st.frameRegs.end();)
+                    it = isVolatileFamily(it->first, is64_) ? st.frameRegs.erase(it) : std::next(it);
+                continue;
+            }
+            // Anything else that writes a tracked register invalidates it.
+            for (auto it = st.frameRegs.begin(); it != st.frameRegs.end();)
+                it = instWritesFamily(in, it->first) ? st.frameRegs.erase(it) : std::next(it);
+            if (instWritesFamily(in, Family::F_RSP)) st.spKnown = false;
+        }
+        return st;
+    };
+
+    // Reverse post-order converges fastest, and a predecessor whose exit is
+    // not yet known must be ignored rather than treated as holding nothing:
+    // this is a must-analysis, so an unknown predecessor would wrongly erase
+    // every fact at the merge.
+    Digraph g((int)n);
+    g.entry = 0;
+    for (size_t i = 0; i < n; ++i)
+        for (const auto& e : mf_.blocks[i].succs)
+            if (e.target >= 0) g.addEdge((int)i, e.target);
+    std::vector<int> order = reversePostOrder(g);
+    for (size_t i = 0; i < n; ++i)
+        if (std::find(order.begin(), order.end(), (int)i) == order.end()) order.push_back((int)i);
+
+    for (int round = 0; round < 32; ++round) {
+        bool changed = false;
+        for (int i : order) {
+            if (!hasEntry[i]) continue;
+            State out = transfer(i, entry[i]);
+            if (!hasExit[i] || !(out == exitState[i])) {
+                exitState[i] = out;
+                hasExit[i] = 1;
+                changed = true;
+            }
+        }
+        for (int i : order) {
+            State merged;
+            bool first = true;
+            bool any = false;
+            for (int p : mf_.blocks[i].preds) {
+                if (!hasExit[p]) continue;
+                any = true;
+                const State& e = exitState[p];
+                if (first) {
+                    merged = e;
+                    first = false;
+                    continue;
+                }
+                if (merged.sp != e.sp || !e.spKnown) merged.spKnown = merged.spKnown && e.spKnown && merged.sp == e.sp;
+                // Keep only the frame registers every predecessor agrees on.
+                for (auto it = merged.frameRegs.begin(); it != merged.frameRegs.end();) {
+                    auto o = e.frameRegs.find(it->first);
+                    it = (o == e.frameRegs.end() || o->second != it->second) ? merged.frameRegs.erase(it)
+                                                                             : std::next(it);
+                }
+            }
+            if (i == 0) {
+                merged = State{};
+                merged.spKnown = true;
+                any = true;
+            }
+            if (!any) continue;
+            if (!hasEntry[i] || !(entry[i] == merged)) {
+                entry[i] = merged;
+                hasEntry[i] = 1;
+                changed = true;
+            }
+        }
+        if (!changed) break;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        blockEntrySp_[i] = entry[i].sp;
+        blockSpKnown_[i] = entry[i].spKnown ? 1 : 0;
+        blockFrameRegs_[i] = entry[i].frameRegs;
+    }
+}
+
 // A flag record only survives into a block when every predecessor leaves the
 // same defining instruction, the flags were not clobbered, and nothing has
 // changed the values that instruction compared.
@@ -1980,7 +2136,6 @@ void Lifter::computeFlagEntryStates() {
     size_t n = mf_.blocks.size();
     flagDefIn_.assign(n, nullptr);
     flagDefOut_.assign(n, nullptr);
-    std::vector<char> known(n, 0);
     const x86::Instruction* const kConflict = (const x86::Instruction*)1;
     for (int round = 0; round < 4; ++round) {
         bool changed = false;
@@ -2017,7 +2172,6 @@ void Lifter::computeFlagEntryStates() {
         }
         if (!changed) break;
     }
-    (void)known;
 }
 
 void Lifter::liftBlock(int mb) {
@@ -2031,6 +2185,8 @@ void Lifter::liftBlock(int mb) {
     spDelta_ = blockEntrySp_[mb];
     spKnown_ = blockSpKnown_[mb] != 0;
     if (spKnown_) regs_->setStackRelative(Family::F_RSP, spDelta_);
+    if (mb < (int)blockFrameRegs_.size())
+        for (const auto& [fam, delta] : blockFrameRegs_[mb]) regs_->setStackRelative(fam, delta);
 
     // Re-evaluate the comparison that set the incoming flags so conditions in
     // this block fold to a single comparison instead of composing flag bits.
@@ -2061,15 +2217,19 @@ void Lifter::liftBlock(int mb) {
     }
 
     const JumpTable* jt = b.jumpTable >= 0 ? &mf_.jumpTables[b.jumpTable] : nullptr;
+    // The index register is reused for the table base further down, so it has
+    // to be read at the point the slicer identified, not at the table load.
+    if (jt && jt->indexFamily != Family::None) {
+        // Read it at block entry first, which is right when the index was
+        // computed in a predecessor. If it is computed in this block the read
+        // below replaces this one, and this one becomes dead.
+        addr_ = b.start;
+        switchIndex_ = regs_->readFamily(jt->indexFamily, std::min<unsigned>(familyWidth(jt->indexFamily), 4));
+    }
     size_t callIdx = 0;
     for (size_t i = 0; i < b.insns.size(); ++i) {
         const Instruction& in = b.insns[i];
         addr_ = in.address;
-        // Capture the switch index before the table load consumes the register.
-        if (jt && in.address == jt->loadAddress && jt->indexFamily != Family::None) {
-            unsigned w = std::min<unsigned>(familyWidth(jt->indexFamily), 4);
-            switchIndex_ = regs_->readFamily(jt->indexFamily, w);
-        }
         bool last = i + 1 == b.insns.size();
         if (in.isCall()) {
             const CallSite* cs = nullptr;
@@ -2080,6 +2240,10 @@ void Lifter::liftBlock(int mb) {
         }
         if (last && (in.endsBlock() || b.term == Terminator::TailCall)) break;
         liftInstruction(in);
+        if (jt && jt->indexAddress == in.address && jt->indexFamily != Family::None) {
+            addr_ = in.address;
+            switchIndex_ = regs_->readFamily(jt->indexFamily, std::min<unsigned>(familyWidth(jt->indexFamily), 4));
+        }
     }
     emitTerminator(b);
 }

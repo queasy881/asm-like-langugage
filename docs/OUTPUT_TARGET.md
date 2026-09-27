@@ -82,3 +82,17 @@ INT decode_packet(struct s_decode_packet_arg1* arg1, INT arg2, LONGLONG* arg3, L
 8. **Confidence annotation** per function (`/* confidence: HIGH */`) derived
    from how much the analysis had to guess: unsupported instructions,
    unresolved indirect control flow, escaped frame memory, uncertain types.
+
+## Known limits
+
+* **Packed SIMD is not modelled.** Scalar SSE (`movss`/`addsd`/`cvtsi2sd`
+  and friends) and the shuffles that stay inside the low 64 bits are lifted
+  exactly. Genuinely vectorised code (`pmuludq`, `psrlq`, `paddd` over full
+  128-bit lanes, as GCC emits for an auto-vectorised loop) is lifted to an
+  explicit `asm("...")` intrinsic plus a note on the function. Such a function
+  is reported as incomplete rather than silently given a wrong body.
+* **x87 assumes a balanced stack across blocks**, which is what compiler
+  output does but not what hand-written assembly must do.
+* **Alias analysis assumes an unknown pointer does not point into the current
+  frame** unless a frame address escaped, which is the standard assumption and
+  is what makes stack slots promotable.

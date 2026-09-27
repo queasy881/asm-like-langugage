@@ -55,6 +55,10 @@ InterpResult runFunction(const ir::Function& f, const pe::Image* img, const std:
         ret = h;
         return true;
     };
+    io.argValue = [&](unsigned index, Type, u64& out) {
+        out = index < args.size() ? args[index] : 0;
+        return true;
+    };
     InterpResult r = interpret(f, mem, io);
     if (writes) *writes = mem.writeLog;
     return r;
@@ -238,13 +242,14 @@ TEST(interp_matches_known_algorithms) {
         ConventionInfo ci = conventionInfo(CallConv::Win64, true);
         io.entryValue = [&](Loc l, u64& out) {
             out = 0;
-            if (l.kind != LocKind::Reg) return true;
-            x86::Family fam = (x86::Family)l.index;
-            if (fam == x86::Family::F_RSP) { out = io.stackBase; return true; }
-            for (size_t i = 0; i < ci.intArgRegs.size(); ++i)
-                if (ci.intArgRegs[i] == fam && i < args.size()) { out = args[i]; return true; }
+            if (l.kind == LocKind::Reg && (x86::Family)l.index == x86::Family::F_RSP) out = io.stackBase;
             return true;
         };
+        io.argValue = [&](unsigned index, Type, u64& out) {
+            out = index < args.size() ? args[index] : 0;
+            return true;
+        };
+        (void)ci;
         return interpret(*r->ir, mem, io);
     };
 
@@ -344,13 +349,14 @@ TEST(interp_matches_known_algorithms) {
             ConventionInfo ci = conventionInfo(CallConv::Win64, true);
             io.entryValue = [&](Loc l, u64& out) {
                 out = 0;
-                if (l.kind != LocKind::Reg) return true;
-                x86::Family fam = (x86::Family)l.index;
-                if (fam == x86::Family::F_RSP) { out = io.stackBase; return true; }
-                for (size_t i = 0; i < ci.intArgRegs.size(); ++i)
-                    if (ci.intArgRegs[i] == fam && i < args.size()) { out = args[i]; return true; }
+                if (l.kind == LocKind::Reg && (x86::Family)l.index == x86::Family::F_RSP) out = io.stackBase;
                 return true;
             };
+            io.argValue = [&](unsigned index, Type, u64& out) {
+                out = index < args.size() ? args[index] : 0;
+                return true;
+            };
+            (void)ci;
             InterpResult ir2 = interpret(*r->ir, mem, io);
             CHECK(ir2.ok);
             if (!ir2.ok) {
