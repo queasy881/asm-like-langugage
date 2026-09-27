@@ -17,6 +17,7 @@
 //     conditions are materialised from the recorded defining operation.
 #pragma once
 
+#include "analysis/graph.h"
 #include "support/common.h"
 
 #include <array>
@@ -71,6 +72,7 @@ enum class Op : u8 {
     Const,        // imm
     Undef,        // an undefined value (never observed by correct code)
     Arg,          // incoming function parameter, aux = parameter index
+    EntryValue,   // the value a location held on entry (loc names it)
     GlobalAddr,   // address of a global, imm = VA
     FrameAddr,    // address of a stack object, imm = frame offset (signed)
     Phi,          // one argument per predecessor, in block predecessor order
@@ -257,6 +259,10 @@ public:
 
     // Removes instructions marked dead and compacts block instruction lists.
     void removeDeadInsts();
+    // Drops blocks not reachable from the entry, renumbering the rest.
+    void pruneUnreachableBlocks();
+    // The CFG as a generic digraph (block ids match).
+    Digraph cfg() const;
     void replaceAllUses(ValueId from, ValueId to);
     // All users of a value. Recomputed on demand (analysis passes cache it).
     std::unordered_map<ValueId, std::vector<ValueId>> buildUses() const;

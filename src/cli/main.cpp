@@ -2,6 +2,7 @@
 #include "analysis/cfg_dump.h"
 #include "analysis/program.h"
 #include "disasm/disassembler.h"
+#include "core/pipeline.h"
 #include "lift/lifter.h"
 #include "pe/pe_image.h"
 
@@ -21,6 +22,10 @@ struct Options {
     bool cfg = false;
     bool blocks = false;
     bool ir = false;
+    bool ssa = false;
+    bool frame = false;
+    bool opt2 = false;
+    bool stats = false;
     bool verify = false;
     std::string function; // address or name filter
 };
@@ -35,6 +40,10 @@ void usage() {
         "  --blocks            basic blocks with instructions\n"
         "  --cfg               control-flow graphs (edges, dominators, loops)\n"
         "  --ir                lifted IR (pre-SSA)\n"
+        "  --ssa               IR in SSA form\n"
+        "  --frame             recovered stack frame layout\n"
+        "  --opt               optimised SSA\n"
+        "  --stats             per-function pipeline statistics\n"
         "  --verify            run IR verification and report problems\n"
         "\n"
         "filters:\n"
@@ -103,6 +112,10 @@ int main(int argc, char** argv) {
         else if (a == "--cfg") opt.cfg = true;
         else if (a == "--blocks") opt.blocks = true;
         else if (a == "--ir") opt.ir = true;
+        else if (a == "--ssa") opt.ssa = true;
+        else if (a == "--frame") opt.frame = true;
+        else if (a == "--opt") opt.opt2 = true;
+        else if (a == "--stats") opt.stats = true;
         else if (a == "--verify") opt.verify = true;
         else if (a == "--function" && i + 1 < argc) opt.function = argv[++i];
         else if (!a.empty() && a[0] == '-') { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); usage(); return 2; }
@@ -122,6 +135,40 @@ int main(int argc, char** argv) {
         if (!opt.function.empty() && funcs.empty()) {
             std::fprintf(stderr, "error: no function matches '%s'\n", opt.function.c_str());
             return 1;
+        }
+        if (opt.ssa || opt.frame || opt.opt2 || opt.stats) {
+            PipelineOptions po;
+            po.verifyStages = true;
+            Pipeline pipe(prog, po);
+            int problems = 0;
+            for (Function* f : funcs) {
+                auto r = (opt.opt2 || opt.stats) ? pipe.runToOptimized(*f) : pipe.runToSsa(*f);
+                if (opt.frame) std::printf("\n%s @ 0x%llx\n%s", f->name.c_str(), (unsigned long long)f->entry, r->frame.print().c_str());
+                if (opt.ssa || opt.opt2) {
+                    std::printf("\n%s", r->ir->print(false).c_str());
+                    std::printf("  ; %d phis inserted, %d pruned by liveness\n", r->ssa.phisInserted, r->ssa.phisPruned);
+                }
+                if (opt.stats) {
+                    size_t insts = 0;
+                    int phis = 0, casts = 0;
+                    for (const auto& b : r->ir->blocks())
+                        for (auto v : b.insts) {
+                            ++insts;
+                            if (r->ir->inst(v).op == ir::Op::Phi) ++phis;
+                            if (ir::isCast(r->ir->inst(v).op)) ++casts;
+                        }
+                    std::printf("%-28s machine %4zu -> ir %4zu insts, %3d phis, %3d casts, %2zu frame slots (%u promoted)\n",
+                                f->name.c_str(), f->instructionCount(), insts, phis, casts,
+                                r->frame.slots.size(), r->frame.promotedCount);
+                }
+                if (!r->problems.empty()) {
+                    ++problems;
+                    std::printf("\nproblems in %s:\n", f->name.c_str());
+                    for (const auto& p : r->problems) std::printf("  %s\n", p.c_str());
+                }
+            }
+            if (problems) std::printf("\n%d functions with problems\n", problems);
+            return problems ? 1 : 0;
         }
         if (opt.ir || opt.verify) {
             int problems = 0;

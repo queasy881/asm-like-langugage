@@ -28,6 +28,7 @@ struct OpDesc {
 
 const OpDesc kOps[] = {
     {"const", 0, 0, 0, 0, 0, 0}, {"undef", 0, 0, 0, 0, 0, 0}, {"arg", 0, 0, 0, 0, 0, 0},
+    {"entryvalue", 0, 0, 0, 0, 0, 0},
     {"globaladdr", 0, 0, 0, 0, 0, 0}, {"frameaddr", 0, 0, 0, 0, 0, 0}, {"phi", 0, 0, 0, 0, 0, 0},
     {"readloc", 0, 0, 0, 0, 0, 0}, {"writeloc", 0, 0, 0, 0, 0, 1},
     {"add", 0, 1, 0, 0, 0, 0}, {"sub", 0, 0, 0, 0, 0, 0}, {"mul", 0, 1, 0, 0, 0, 0},
@@ -264,6 +265,65 @@ void Function::removeDeadInsts() {
     }
 }
 
+Digraph Function::cfg() const {
+    Digraph g((int)blocks_.size());
+    g.entry = 0;
+    for (const auto& b : blocks_)
+        for (int s : b.succs) g.addEdge(b.id, s);
+    return g;
+}
+
+void Function::pruneUnreachableBlocks() {
+    if (blocks_.empty()) return;
+    std::vector<bool> seen(blocks_.size(), false);
+    std::vector<int> work{0};
+    seen[0] = true;
+    while (!work.empty()) {
+        int b = work.back();
+        work.pop_back();
+        for (int s : blocks_[b].succs)
+            if (!seen[s]) { seen[s] = true; work.push_back(s); }
+    }
+    if (std::find(seen.begin(), seen.end(), false) == seen.end()) return;
+    std::vector<int> remap(blocks_.size(), -1);
+    int next = 0;
+    for (size_t i = 0; i < blocks_.size(); ++i)
+        if (seen[i]) remap[i] = next++;
+    std::vector<Block> kept;
+    kept.reserve(next);
+    for (size_t i = 0; i < blocks_.size(); ++i) {
+        if (!seen[i]) continue;
+        Block b = std::move(blocks_[i]);
+        // Drop phi arguments coming from removed predecessors.
+        std::vector<size_t> keepArgs;
+        for (size_t p = 0; p < b.preds.size(); ++p)
+            if (remap[b.preds[p]] >= 0) keepArgs.push_back(p);
+        if (keepArgs.size() != b.preds.size()) {
+            for (ValueId v : b.insts) {
+                Inst& in = insts_[v];
+                if (in.op != Op::Phi) continue;
+                std::vector<ValueId> na;
+                for (size_t k : keepArgs)
+                    if (k < in.args.size()) na.push_back(in.args[k]);
+                in.args = std::move(na);
+            }
+        }
+        b.id = remap[i];
+        std::vector<int> ns;
+        for (int s : b.succs)
+            if (remap[s] >= 0) ns.push_back(remap[s]);
+        b.succs = std::move(ns);
+        std::vector<int> np;
+        for (int p : b.preds)
+            if (remap[p] >= 0) np.push_back(remap[p]);
+        b.preds = std::move(np);
+        if (b.defaultSucc >= 0) b.defaultSucc = remap[b.defaultSucc];
+        for (ValueId v : b.insts) insts_[v].block = b.id;
+        kept.push_back(std::move(b));
+    }
+    blocks_ = std::move(kept);
+}
+
 std::string Function::print(bool withAddresses) const {
     std::ostringstream os;
     os << "function " << name_ << " @ " << hex(entryAddr_) << " -> " << returnType_.str() << "\n";
@@ -302,6 +362,9 @@ std::string Function::print(bool withAddresses) const {
                 break;
             case Op::Arg:
                 os << " #" << in.aux;
+                break;
+            case Op::EntryValue:
+                os << " " << in.loc.str();
                 break;
             case Op::ReadLoc:
             case Op::WriteLoc:
